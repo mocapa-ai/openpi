@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.fastumi_policy as fastumi_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -906,6 +907,87 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # FastUMI xArm6 configs.
+    #
+    TrainConfig(
+        name="pi05_fastumi_xarm6",
+        model=pi0_config.Pi0Config(
+            action_horizon=10,
+            pi05=True,
+            discrete_state_input=False,
+        ),
+        data=SimpleDataConfig(
+            # Point this to your converted LeRobot dataset
+            repo_id="your_hf_username/fastumi_xarm6_pickplace",
+            # You can optionally load norm stats from pi05 base if your xArm6 was in pretraining
+            # Otherwise, new norm stats will be computed from your data
+            assets=AssetsConfig(asset_id="xarm6"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[fastumi_policy.FastUMIXArm6Inputs(model_type=ModelType.PI05)],
+                outputs=[fastumi_policy.FastUMIXArm6Outputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        # Load pi05 base model for finetuning
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Training hyperparameters
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=20_000,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_fastumi_xarm6_lora",
+        # LoRA version for lower memory requirements
+        model=pi0_config.Pi0Config(
+            action_horizon=10,
+            pi05=True,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=SimpleDataConfig(
+            repo_id="your_hf_username/fastumi_xarm6_pickplace",
+            assets=AssetsConfig(asset_id="xarm6"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[fastumi_policy.FastUMIXArm6Inputs(model_type=ModelType.PI05)],
+                outputs=[fastumi_policy.FastUMIXArm6Outputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            action_horizon=10,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # Turn off EMA for LoRA
+        num_train_steps=20_000,
+        save_interval=1000,
+        log_interval=100,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

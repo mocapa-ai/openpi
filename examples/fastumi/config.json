@@ -1,0 +1,27 @@
+{
+  "urdf_path": "examples/fastumi/assets/xarm6_robot.urdf",
+  "start_qpos": [0, 0, 0, 0, 0, 0, 0],
+  "base_position": {
+    "x": 0.49643,
+    "y": -0.00588,
+    "z": 0.35984
+  },
+  "base_orientation": {
+    "roll": 179.94725,
+    "pitch": -89.999981,
+    "yaw": 0.0
+  },
+  "offset": {
+    "x": 0.14565,
+    "z": 0.1586
+  },
+  "gripper": {
+    "marker_max": 566.0,
+    "marker_min": 140.0,
+    "gripper_max": 850.0,
+    "flange_to_tcp": 0.25
+  },
+  "aruco_dict": "DICT_4X4_50",
+  "marker_id_0": 0,
+  "marker_id_1": 1
+}
