@@ -18,10 +18,12 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.custom_robot_policy as custom_robot_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.custom_robot_config as custom_robot_config
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -960,6 +962,10 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+    #
+    # Custom Robot configs (example for 6-DOF arm + 6-DOF hand).
+    #
+    custom_robot_config.CUSTOM_ROBOT_PI05_CONFIG,
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
