@@ -239,8 +239,8 @@ def main(
             continue
     
     print(f"\nDataset created successfully at: {output_path}")
-    print(f"Total episodes: {len(dataset.episodes)}")
-    print(f"Total frames: {len(dataset)}")
+    print(f"Total episodes: {dataset.num_episodes}")
+    print(f"Total frames: {dataset.num_frames}")
     
     # Optionally push to Hugging Face Hub
     if push_to_hub:

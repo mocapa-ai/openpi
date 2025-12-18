@@ -96,8 +96,8 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 dataset = LeRobotDataset("test/single_trajectory")
 
 print(f"\n✅ Dataset loaded successfully!")
-print(f"  Total episodes: {len(dataset.episodes)}")
-print(f"  Total frames: {len(dataset)}")
+print(f"  Total episodes: {dataset.num_episodes}")
+print(f"  Total frames: {dataset.num_frames}")
 print(f"  FPS: {dataset.fps}")
 print(f"  Features: {list(dataset.features.keys())}")
 
