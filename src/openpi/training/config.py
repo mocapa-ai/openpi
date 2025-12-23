@@ -18,12 +18,11 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
-import openpi.policies.custom_robot_policy as custom_robot_policy
+import openpi.policies.airbot_policy as airbot_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
-import openpi.training.custom_robot_config as custom_robot_config
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -348,6 +347,59 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAirBotDataConfig(DataConfigFactory):
+    """
+    Config for AirBot Play (6-DOF arm + 6-DOF Revo2 hand).
+    
+    This config processes data from the test_pi_finetune LeRobot dataset for training.
+    AirBot has a single top-down camera and 12 action dimensions (6 arm + 6 hand).
+    """
+    
+    repo_id: str = "test_pi_finetune"
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform: map LeRobot dataset keys to inference keys
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",  # Single top-down camera
+                        "observation/state": "state",  # 12D joint positions
+                        "actions": "actions",  # 12D actions
+                        # Note: "task" will be converted to "prompt" by prompt_from_task=True
+                    }
+                )
+            ]
+        )
+        
+        # Data transforms: convert between robot format and model format
+        data_transforms = _transforms.Group(
+            inputs=[airbot_policy.AirBotInputs(model_type=model_config.model_type)],
+            outputs=[airbot_policy.AirBotOutputs()],
+        )
+        
+        # AirBot actions are absolute joint positions, convert to deltas
+        # All 12 dimensions (6 arm + 6 hand) use delta actions
+        delta_action_mask = _transforms.make_bool_mask(12)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        
+        # Model transforms (standard, no changes needed)
+        # Use default_prompt to inject prompt if task lookup fails
+        model_transforms = ModelTransformFactory(default_prompt="Pick up the ball and put it in the box")(model_config)
+        
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -963,9 +1015,81 @@ _CONFIGS = [
     #
     *roboarena_config.get_roboarena_configs(),
     #
-    # Custom Robot configs (example for 6-DOF arm + 6-DOF hand).
+    # AirBot Play configs (6-DOF arm + 6-DOF Revo2 hand).
     #
-    custom_robot_config.CUSTOM_ROBOT_PI05_CONFIG,
+    TrainConfig(
+        name="airbot_pi05",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=3e-5,  # LoRA learning rate
+            decay_steps=20_000,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=0.01),
+        ema_decay=0.99,
+        data=LeRobotAirBotDataConfig(
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=4,  # Reduce batch size for memory
+        num_workers=4,
+        num_train_steps=20_000,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="airbot_pi05_full",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            action_dim=32,  # Use 32 to match checkpoint
+            max_token_len=256,
+            dtype="bfloat16",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-5,  # Lower LR for full fine-tuning
+            decay_steps=20_000,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=0.01),
+        ema_decay=0.99,
+        data=LeRobotAirBotDataConfig(
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,  # Smaller batch for memory
+        num_workers=4,
+        num_train_steps=20_000,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="airbot_pi05_debug",
+        project_name="openpi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            action_dim=32,  # Use 32 to match checkpoint
+            max_token_len=256,
+            dtype="bfloat16",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=3e-5,
+            decay_steps=100,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=0.01),
+        ema_decay=0.99,
+        data=FakeDataConfig(),  # Use fake data for debugging
+        batch_size=4,
+        num_workers=1,
+        num_train_steps=100,
+        save_interval=50,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

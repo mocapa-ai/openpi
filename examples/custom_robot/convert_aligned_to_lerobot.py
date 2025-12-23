@@ -175,6 +175,7 @@ def main(
     
     # Create feature specification for LeRobot dataset
     # Pi0.5 expects: "observation/state" -> "state", "observation/image" -> camera
+    # Note: "prompt" is handled automatically by LeRobot, don't define it here
     features = {
         "image": {
             "dtype": "image",
@@ -224,7 +225,7 @@ def main(
                 frame_dict = {
                     "state": episode_data['qpos'][t].astype(np.float32),
                     "actions": episode_data['actions'][t].astype(np.float32),
-                    "task": episode_data['language'],
+                    "task": episode_data['language'],  # Use "task" like LIBERO
                     "image": resize_image(episode_data['images'][t], image_size),
                 }
                 

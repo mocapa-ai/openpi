@@ -1,9 +1,9 @@
 """
-Custom robot policy classes for OpenPI.
+AirBot robot policy classes for OpenPI.
 
-This module defines the input/output transforms for a custom robot with:
+This module defines the input/output transforms for AirBot Play with:
 - 6-DOF arm
-- 6-DOF dexterous hand
+- 6-DOF dexterous hand (Revo2)
 - Total: 12 action dimensions
 
 These classes are used during both training and inference to convert between
@@ -22,12 +22,11 @@ from openpi import transforms
 from openpi.models import model as _model
 
 
-def make_custom_robot_example() -> dict:
-    """Creates a random input example for testing the custom robot policy."""
+def make_airbot_example() -> dict:
+    """Creates a random input example for testing the AirBot policy."""
     return {
         "observation/state": np.random.rand(12),  # 6 arm + 6 hand joints
-        "observation/camera_0": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/wrist_camera": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "pick up the red cube",
     }
 
@@ -58,16 +57,16 @@ def _parse_image(image) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class CustomRobotInputs(transforms.DataTransformFn):
+class AirBotInputs(transforms.DataTransformFn):
     """
-    Converts robot observations to model input format.
+    Converts AirBot observations to model input format.
     
-    Used during both training and inference. Modify this class to match your
-    robot's sensor configuration and data format.
+    Used during both training and inference. Converts AirBot's single camera
+    view to the multi-camera format expected by the model.
     
     Key responsibilities:
     - Parse images to correct format
-    - Map camera views to model inputs
+    - Map single camera to model's expected multiple views
     - Prepare state/action data
     - Handle image masking for missing views
     
@@ -78,14 +77,12 @@ class CustomRobotInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
     
     def __call__(self, data: dict) -> dict:
-        """Convert robot data to model input format.
+        """Convert AirBot data to model input format.
         
         Args:
             data: Dictionary containing:
                 - "observation/state": (12,) float32 - joint positions
-                - "observation/camera_0": (H, W, 3) uint8 - third-person view
-                - "observation/wrist_camera": (H, W, 3) uint8 - wrist view [optional]
-                - "observation/camera_1": (H, W, 3) uint8 - additional view [optional]
+                - "observation/image": (H, W, 3) uint8 - single third-person camera
                 - "actions": (12,) float32 - actions [training only]
                 - "prompt": str - language instruction
         
@@ -97,43 +94,27 @@ class CustomRobotInputs(transforms.DataTransformFn):
                 - "actions": action targets [training only]
                 - "prompt": language instruction
         """
-        # Parse images to uint8 (H, W, C) format
-        # Modify these keys to match your camera names in the LeRobot dataset
-        camera_0 = _parse_image(data["observation/camera_0"])
-        
-        # Handle optional wrist camera
-        if "observation/wrist_camera" in data:
-            wrist_camera = _parse_image(data["observation/wrist_camera"])
-            has_wrist = True
-        else:
-            wrist_camera = np.zeros_like(camera_0)
-            has_wrist = False
-        
-        # Handle optional second exterior camera
-        if "observation/camera_1" in data:
-            camera_1 = _parse_image(data["observation/camera_1"])
-            has_camera_1 = True
-        else:
-            camera_1 = np.zeros_like(camera_0)
-            has_camera_1 = False
+        # Parse image to uint8 (H, W, C) format
+        # AirBot has a single top-down camera view
+        image = _parse_image(data["observation/image"])
         
         # Create model inputs dict
-        # DO NOT change these keys - they are expected by the model
+        # Model expects 3 camera views, so we use the same image for all
+        # and mask out the ones we don't have
         inputs = {
             "state": data["observation/state"],
             "image": {
-                "base_0_rgb": camera_0,  # Primary third-person view
-                "left_wrist_0_rgb": wrist_camera,  # Wrist camera
-                "right_wrist_0_rgb": camera_1,  # Additional view or padding
+                "base_0_rgb": image,  # Primary third-person view
+                "left_wrist_0_rgb": np.zeros_like(image),  # No wrist camera
+                "right_wrist_0_rgb": np.zeros_like(image),  # No additional camera
             },
             "image_mask": {
                 "base_0_rgb": np.True_,  # Always present
-                "left_wrist_0_rgb": np.True_ if has_wrist else np.False_,
-                # PI0_FAST requires all images, PI0/PI05 can mask missing ones
+                "left_wrist_0_rgb": np.False_,  # Not available
                 "right_wrist_0_rgb": (
-                    np.True_ if has_camera_1 or self.model_type == _model.ModelType.PI0_FAST
+                    np.True_ if self.model_type == _model.ModelType.PI0_FAST
                     else np.False_
-                ),
+                ),  # PI0_FAST requires all images
             },
         }
         
@@ -149,12 +130,12 @@ class CustomRobotInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class CustomRobotOutputs(transforms.DataTransformFn):
+class AirBotOutputs(transforms.DataTransformFn):
     """
-    Converts model outputs back to robot action format.
+    Converts model outputs back to AirBot action format.
     
     Used during inference only. The model outputs actions padded to its action
-    dimension (e.g., 32), but your robot only needs the first N dimensions.
+    dimension (e.g., 32), but AirBot only needs the first 12 dimensions.
     
     Key responsibilities:
     - Remove action padding
@@ -162,7 +143,7 @@ class CustomRobotOutputs(transforms.DataTransformFn):
     """
     
     def __call__(self, data: dict) -> dict:
-        """Convert model predictions to robot action format.
+        """Convert model predictions to AirBot action format.
         
         Args:
             data: Dictionary containing:
@@ -170,19 +151,12 @@ class CustomRobotOutputs(transforms.DataTransformFn):
         
         Returns:
             Dictionary with:
-                - "actions": (action_horizon, 12) float32 - actual robot actions
+                - "actions": (action_horizon, 12) float32 - AirBot actions
         """
         # Extract only the first 12 actions (remove padding)
-        # The model pads actions to a fixed dimension (e.g., 32), but your
-        # robot only uses the first 12 dimensions
-        #
-        # MODIFY THIS: Change 12 to your actual action dimension
-        # - If you have 6-DOF arm + 6-DOF hand = 12
-        # - If you have different configuration, adjust accordingly
-        #
-        # Action layout (example):
-        # [0:6]   - arm joint velocities/positions
-        # [6:12]  - hand joint velocities/positions
-        robot_actions = np.asarray(data["actions"][:, :12])
+        # Action layout:
+        # [0:6]   - arm joint positions/velocities
+        # [6:12]  - hand (Revo2) joint positions/velocities
+        airbot_actions = np.asarray(data["actions"][:, :12])
         
-        return {"actions": robot_actions}
+        return {"actions": airbot_actions}
