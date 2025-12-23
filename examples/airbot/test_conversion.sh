@@ -14,12 +14,12 @@ echo ""
 
 # Step 1: Check if demo0.hdf5 exists
 if [ ! -f "demo0.hdf5" ]; then
-    echo "❌ demo0.hdf5 not found in current directory"
+    echo "[ERROR] demo0.hdf5 not found in current directory"
     echo "   Please run align_proprioception_pi.py first"
     exit 1
 fi
 
-echo "✅ Found demo0.hdf5"
+echo "[OK] Found demo0.hdf5"
 echo ""
 
 # Step 2: Inspect the aligned HDF5 structure
@@ -29,25 +29,25 @@ uv run python << 'EOF'
 import h5py
 
 with h5py.File("demo0.hdf5", 'r') as f:
-    print("\n📁 File attributes:")
+    print("\n[FILES] File attributes:")
     for attr_name, attr_value in f.attrs.items():
         print(f"  {attr_name}: {attr_value}")
     
     if 'pi05_compatible' in f.attrs and f.attrs['pi05_compatible']:
-        print("\n✅ Pi0.5 compatible format detected!")
+        print("\n[OK] Pi0.5 compatible format detected!")
         
         demo = f['data']['demo_0']
         qpos = demo['obs']['qpos']
         action = demo['action']
         images = demo['obs']['images']['top']
         
-        print(f"\n📊 Data shapes:")
+        print(f"\n[DATA] Data shapes:")
         print(f"  State (qpos): {qpos.shape} - {qpos.dtype}")
         print(f"  Actions: {action.shape} - {action.dtype}")
         print(f"  Images: {images.shape} - {images.dtype}")
         print(f"  Task: {demo.attrs.get('task', 'N/A')}")
     else:
-        print("\n❌ NOT a Pi0.5 aligned format!")
+        print("\n[ERROR] NOT a Pi0.5 aligned format!")
         print("   Run align_proprioception_pi.py first")
         exit(1)
 EOF
@@ -74,15 +74,15 @@ from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 
 dataset_path = HF_LEROBOT_HOME / "test/single_trajectory"
 
-print(f"\n📦 LeRobot dataset location:")
+print(f"\n[PACKAGE] LeRobot dataset location:")
 print(f"  {dataset_path}")
 
 if not dataset_path.exists():
-    print("\n❌ Dataset not found!")
+    print("\n[ERROR] Dataset not found!")
     exit(1)
 
-print(f"\n✅ Dataset created!")
-print(f"\n📁 Dataset structure:")
+print(f"\n[OK] Dataset created!")
+print(f"\n[FILES] Dataset structure:")
 for item in sorted(dataset_path.rglob("*")):
     if item.is_file():
         rel_path = item.relative_to(dataset_path)
@@ -90,19 +90,19 @@ for item in sorted(dataset_path.rglob("*")):
         print(f"  {rel_path} ({size_mb:.2f} MB)")
 
 # Load and inspect the dataset
-print(f"\n📊 Loading dataset...")
+print(f"\n[DATA] Loading dataset...")
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 dataset = LeRobotDataset("test/single_trajectory")
 
-print(f"\n✅ Dataset loaded successfully!")
+print(f"\n[OK] Dataset loaded successfully!")
 print(f"  Total episodes: {dataset.num_episodes}")
 print(f"  Total frames: {dataset.num_frames}")
 print(f"  FPS: {dataset.fps}")
 print(f"  Features: {list(dataset.features.keys())}")
 
 # Check first frame
-print(f"\n🔍 First frame inspection:")
+print(f"\n[CHECK] First frame inspection:")
 first_frame = dataset[0]
 for key, value in first_frame.items():
     if hasattr(value, 'shape'):
@@ -110,8 +110,8 @@ for key, value in first_frame.items():
     else:
         print(f"  {key}: {value}")
 
-print(f"\n✅ All checks passed!")
-print(f"\n💡 Next steps:")
+print(f"\n[OK] All checks passed!")
+print(f"\n[TIP] Next steps:")
 print(f"  1. Collect more trajectories (aim for 50+)")
 print(f"  2. Run batch alignment")
 print(f"  3. Convert all to one dataset")

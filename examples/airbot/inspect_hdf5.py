@@ -17,7 +17,7 @@ if len(sys.argv) < 2:
 hdf5_path = sys.argv[1]
 
 if not Path(hdf5_path).exists():
-    print(f"❌ File not found: {hdf5_path}")
+    print(f"[ERROR] File not found: {hdf5_path}")
     sys.exit(1)
 
 print("=" * 70)
@@ -25,17 +25,17 @@ print(f"Inspecting: {hdf5_path}")
 print("=" * 70)
 
 with h5py.File(hdf5_path, 'r') as f:
-    print("\n📁 Top-level groups:")
+    print("\n[FILES] Top-level groups:")
     for key in f.keys():
         print(f"  - {key}")
     
-    print("\n🔍 File attributes:")
+    print("\n[CHECK] File attributes:")
     for attr_name, attr_value in f.attrs.items():
         print(f"  {attr_name}: {attr_value}")
     
     # Check if it's the aligned format
     if 'pi05_compatible' in f.attrs:
-        print(f"\n✅ Pi0.5 compatible format detected!")
+        print(f"\n[OK] Pi0.5 compatible format detected!")
         print(f"   Task: {f.attrs.get('task', 'N/A')}")
         print(f"   Arm side: {f.attrs.get('arm_side', 'N/A')}")
         print(f"   State dim: {f.attrs.get('state_dim', 'N/A')}")
@@ -44,7 +44,7 @@ with h5py.File(hdf5_path, 'r') as f:
         
         if 'data' in f and 'demo_0' in f['data']:
             demo = f['data']['demo_0']
-            print("\n📊 Demo structure:")
+            print("\n[DATA] Demo structure:")
             
             # Show qpos
             if 'obs' in demo and 'qpos' in demo['obs']:
@@ -71,8 +71,8 @@ with h5py.File(hdf5_path, 'r') as f:
             if 'task' in demo.attrs:
                 print(f"  task: \"{demo.attrs['task']}\"")
             
-            print("\n✅ This file is ready for conversion to LeRobot!")
+            print("\n[OK] This file is ready for conversion to LeRobot!")
     else:
-        print("\n⚠️  This doesn't appear to be an aligned Pi0.5 format")
+        print("\n[WARNING] This doesn't appear to be an aligned Pi0.5 format")
         print("   Expected 'pi05_compatible' attribute")
         print("   You may need to run align_proprioception_pi.py first")

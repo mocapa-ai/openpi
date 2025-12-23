@@ -24,14 +24,14 @@ print("=" * 70)
 
 # Check if dataset exists
 if not dataset_path.exists():
-    print(f"\n❌ Dataset not found at: {dataset_path}")
+    print(f"\n[ERROR] Dataset not found at: {dataset_path}")
     print(f"\nExpected location: {HF_LEROBOT_HOME}")
     sys.exit(1)
 
-print(f"\n✅ Dataset found at: {dataset_path}")
+print(f"\n[OK] Dataset found at: {dataset_path}")
 
 # Show file structure
-print(f"\n📁 Dataset files:")
+print(f"\n[FILES] Dataset files:")
 for item in sorted(dataset_path.rglob("*")):
     if item.is_file():
         rel_path = item.relative_to(dataset_path)
@@ -39,22 +39,22 @@ for item in sorted(dataset_path.rglob("*")):
         print(f"  {rel_path} ({size_mb:.2f} MB)")
 
 # Load dataset
-print(f"\n📊 Loading dataset...")
+print(f"\n[DATA] Loading dataset...")
 try:
     dataset = LeRobotDataset(dataset_name)
-    print(f"✅ Dataset loaded successfully!")
+    print(f"[OK] Dataset loaded successfully!")
 except Exception as e:
-    print(f"❌ Failed to load dataset: {e}")
+    print(f"[ERROR] Failed to load dataset: {e}")
     sys.exit(1)
 
 # Show dataset info
-print(f"\n📈 Dataset statistics:")
+print(f"\n[STATS] Dataset statistics:")
 print(f"  Total episodes: {len(dataset.episodes)}")
 print(f"  Total frames: {len(dataset)}")
 print(f"  FPS: {dataset.fps}")
 print(f"  Robot type: {dataset.robot_type}")
 
-print(f"\n🔑 Features:")
+print(f"\n[KEYS] Features:")
 for feature_name, feature_info in dataset.features.items():
     if 'shape' in feature_info:
         print(f"  {feature_name}: shape={feature_info['shape']}, dtype={feature_info['dtype']}")
@@ -62,7 +62,7 @@ for feature_name, feature_info in dataset.features.items():
         print(f"  {feature_name}: {feature_info}")
 
 # Inspect first frame
-print(f"\n🔍 First frame:")
+print(f"\n[CHECK] First frame:")
 first_frame = dataset[0]
 for key, value in first_frame.items():
     if hasattr(value, 'shape'):
@@ -74,14 +74,14 @@ for key, value in first_frame.items():
         print(f"  {key}: {value}")
 
 # Show episode info
-print(f"\n📦 Episode info:")
+print(f"\n[PACKAGE] Episode info:")
 for ep_idx, episode in enumerate(dataset.episodes):
     print(f"  Episode {ep_idx}:")
     print(f"    Length: {episode['length']} frames")
     print(f"    Task: {episode.get('task', 'N/A')}")
 
-print(f"\n✅ Verification complete!")
-print(f"\n💡 This dataset is ready for training!")
+print(f"\n[OK] Verification complete!")
+print(f"\n[TIP] This dataset is ready for training!")
 print(f"\nNext steps:")
 print(f"  1. Collect more trajectories (aim for 50+)")
 print(f"  2. Convert all to one larger dataset")
