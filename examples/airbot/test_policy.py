@@ -25,7 +25,7 @@ from openpi.policies import policy_config
 @dataclasses.dataclass
 class Args:
     """Command line arguments."""
-    checkpoint_dir: str = "checkpoints/airbot_pi05/20000"
+    checkpoint_dir: str = "checkpoints/airbot_pi05/airbot_v1/20000"
     config_name: str = "airbot_pi05"
 
 
@@ -66,7 +66,7 @@ def main(args: Args):
     # Create random observation (matching your robot specs)
     dummy_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
     dummy_state = np.random.randn(12).astype(np.float32)  # 6 arm + 6 hand
-    dummy_prompt = "pick up the red cube"
+    dummy_prompt = "pick up the ball and put it in the box"
     
     observation = {
         "observation/image": dummy_image,
