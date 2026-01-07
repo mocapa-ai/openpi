@@ -48,14 +48,15 @@ except ImportError:
     AIRBOT_AVAILABLE = False
     print("[WARN] airbot_py not available - using dummy arm")
 
-# TODO: Import your Revo2 hand library
-# try:
-#     from motion_retargeting.hand.revo2_hand import Revo2HandAdapter
-#     REVO2_AVAILABLE = True
-# except ImportError:
-#     REVO2_AVAILABLE = False
-#     print("[WARN] Revo2 hand not available - using dummy hand")
-REVO2_AVAILABLE = False  # Placeholder until you wire it up
+# Import Revo2 hand library directly (no adapter needed)
+try:
+    # Assuming revo2_library will be cloned into openpi/revo2_library
+    from revo2_library.python.revo2.revo2_utils import open_modbus_revo2, libstark
+    import asyncio
+    REVO2_AVAILABLE = True
+except ImportError as e:
+    REVO2_AVAILABLE = False
+    print(f"[WARN] Revo2 hand library not available - using dummy hand: {e}")
 
 
 # =============================================================================
@@ -113,7 +114,7 @@ class AirBotArm:
             print(f"[ARM] Connecting to AirBot on port {self.port}...")
             self.robot = AIRBOTPlay(port=self.port)
             self.robot.connect()
-            self.robot.set_speed_profile(SpeedProfile.FAST)
+            self.robot.set_speed_profile(SpeedProfile.SLOW)
             self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
             print("[ARM] Connected successfully")
             return True
@@ -167,62 +168,189 @@ class AirBotArm:
 
 
 class Revo2Hand:
-    """Revo2 hand controller wrapper."""
+    """
+    Revo2 hand controller - direct implementation using revo2_library.
+    
+    The Revo2 hand has 6 controllable elements:
+      - Thumb, Index, Middle, Ring, Pinky, Wrist
+    
+    Control is in normalized mode (0-1000 range):
+      - 0 = fully open
+      - 1000 = fully closed
+    """
+    
+    # Position constants (in radians, matching training data format)
+    OPEN_POSITION = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    CLOSED_POSITION = np.array([0.0, 0.0, 1.41, 1.41, 1.41, 1.41], dtype=np.float32)
+    
+    # Joint limits for mapping (radians)
+    JOINT_LIMITS = [1.57, 1.03, 1.41, 1.41, 1.41, 1.41]
     
     def __init__(self, port: str, side: str = "right"):
-        self.port = port
+        self.port = port if port != "/dev/ttyUSB1" else None  # None = auto-detect
         self.side = side
-        self.hand = None
+        self.client = None
+        self.slave_id = None
+        self._connected = False
         
     def connect(self) -> bool:
-        """Connect to Revo2 hand."""
+        """Connect to Revo2 hand via Modbus."""
         if not REVO2_AVAILABLE:
-            print("[HAND] Using dummy hand (revo2 not available)")
+            print("[HAND] Using dummy hand (revo2 library not available)")
             return True
         
-        # TODO: Implement actual connection
-        # try:
-        #     from motion_retargeting.hand.revo2_hand import Revo2HandAdapter
-        #     self.hand = Revo2HandAdapter(side=self.side, model_path=self.port)
-        #     self.hand.connect()
-        #     return True
-        # except Exception as e:
-        #     print(f"[HAND] Connection failed: {e}")
-        #     return False
-        return True
+        async def _connect_async():
+            try:
+                print(f"[HAND] Connecting to Revo2 hand (port: {self.port})...")
+                self.client, self.slave_id = await open_modbus_revo2(
+                    port_name=self.port, 
+                    quick=True
+                )
+                
+                # Configure to normalized mode (0-1000 range)
+                await self.client.set_finger_unit_mode(
+                    self.slave_id, 
+                    libstark.FingerUnitMode.Normalized
+                )
+                
+                finger_unit_mode = await self.client.get_finger_unit_mode(self.slave_id)
+                print(f"[HAND] Finger unit mode: {finger_unit_mode}")
+                
+                self._connected = True
+                print("[HAND] Connected successfully")
+                return True
+                
+            except Exception as e:
+                print(f"[HAND] Connection failed: {e}")
+                self._connected = False
+                return False
+        
+        try:
+            return asyncio.run(_connect_async())
+        except Exception as e:
+            print(f"[HAND] Failed to connect: {e}")
+            self._connected = False
+            return False
     
     def disconnect(self):
         """Disconnect from hand."""
-        if self.hand:
+        if self.client:
             try:
-                self.hand.disconnect()
+                async def _disconnect_async():
+                    libstark.modbus_close(self.client)
+                    await asyncio.sleep(0.1)
+                asyncio.run(_disconnect_async())
                 print("[HAND] Disconnected")
             except Exception as e:
                 print(f"[HAND] Disconnect error: {e}")
+            finally:
+                self.client = None
+                self.slave_id = None
+                self._connected = False
     
     def get_joint_positions(self) -> np.ndarray:
-        """Get current finger positions (6 DOF)."""
-        if not self.hand:
+        """
+        Get current finger positions (6 DOF).
+        
+        Returns positions in radians (converted from normalized 0-1000 range).
+        """
+        if not self._connected:
             return np.zeros(6, dtype=np.float32)
+        
+        async def _get_positions_async():
+            try:
+                status = await self.client.get_motor_status(self.slave_id)
+                positions = list(status.positions)
+                return positions
+            except Exception as e:
+                print(f"[HAND] Error reading positions: {e}")
+                return [0] * 6
+        
         try:
-            pos = self.hand.get_joint_positions()
-            return np.array(pos, dtype=np.float32)
+            positions = asyncio.run(_get_positions_async())
+            # Convert from normalized (0-1000) to radians
+            radians = self._revo2_to_radians(positions)
+            return np.array(radians, dtype=np.float32)
         except Exception as e:
-            print(f"[HAND] Error reading positions: {e}")
+            print(f"[HAND] Failed to get positions: {e}")
             return np.zeros(6, dtype=np.float32)
     
     def set_joint_positions(self, positions: np.ndarray):
-        """Set finger positions (6 DOF)."""
-        if not self.hand:
+        """
+        Set finger positions (6 DOF).
+        
+        Args:
+            positions: Array of 6 positions in radians
+        """
+        if not self._connected:
             return
+        
+        if len(positions) != 6:
+            print(f"[HAND] Error: Expected 6 positions, got {len(positions)}")
+            return
+        
+        # Convert from radians to normalized (0-1000)
+        revo2_positions = self._radians_to_revo2(positions)
+        speeds = [1000] * 6  # Max speed for responsiveness
+        
+        async def _set_positions_async():
+            try:
+                await self.client.set_finger_positions_and_speeds(
+                    self.slave_id,
+                    revo2_positions,
+                    speeds
+                )
+            except Exception as e:
+                print(f"[HAND] Error setting positions: {e}")
+        
         try:
-            self.hand.set_joint_positions(positions.tolist())
+            asyncio.run(_set_positions_async())
         except Exception as e:
-            print(f"[HAND] Error setting positions: {e}")
+            print(f"[HAND] Failed to set positions: {e}")
     
     def set_open(self):
         """Open all fingers."""
-        self.set_joint_positions(np.zeros(6))
+        self.set_joint_positions(self.OPEN_POSITION)
+    
+    def set_closed(self):
+        """Close all fingers."""
+        self.set_joint_positions(self.CLOSED_POSITION)
+    
+    def _radians_to_revo2(self, radians: np.ndarray) -> list:
+        """
+        Convert joint positions from radians to Revo2 normalized range (0-1000).
+        
+        Args:
+            radians: 6-element array in radians
+        
+        Returns:
+            List of 6 integers in range [0, 1000]
+        """
+        positions = []
+        for i, rad in enumerate(radians):
+            limit = self.JOINT_LIMITS[i]
+            # Clamp to valid range and scale to 0-1000
+            normalized = int(np.clip(rad, 0.0, limit) * (1000.0 / limit))
+            positions.append(normalized)
+        return positions
+    
+    def _revo2_to_radians(self, revo2_positions: list) -> list:
+        """
+        Convert Revo2 normalized positions (0-1000) to radians.
+        
+        Args:
+            revo2_positions: List of 6 integers in range [0, 1000]
+        
+        Returns:
+            List of 6 floats in radians
+        """
+        radians = []
+        for i, pos in enumerate(revo2_positions):
+            limit = self.JOINT_LIMITS[i]
+            # Convert from 0-1000 to 0-limit radians
+            rad = (pos / 1000.0) * limit
+            radians.append(rad)
+        return radians
 
 
 class Camera:

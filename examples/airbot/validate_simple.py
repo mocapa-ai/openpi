@@ -46,7 +46,7 @@ class Args:
     """Command line arguments for single-PC validation."""
     
     # Model/checkpoint
-    checkpoint_dir: str = "checkpoints/airbot_pi05/20000"
+    checkpoint_dir: str = "checkpoints/airbot_pi05/airbot_v1/20000"
     config_name: str = "airbot_pi05"
     
     # Rollout parameters
