@@ -77,7 +77,14 @@ class Args:
     num_episodes: int = 5
     max_episode_steps: int = 600  # ~20 seconds at 30 Hz
     control_freq: int = 30  # Hz
-    action_horizon: int = 15  # Execute N actions before re-querying policy
+    action_horizon: int = 8  # Execute N actions before re-querying policy
+    
+    # Camera configuration (Orbbec)
+    # NOTE: Should match aspect ratio used during training for best results
+    # Training used 320x180 (16:9), so we capture at same aspect ratio
+    camera_width: int = 640   # Will be resized by policy server
+    camera_height: int = 360  # 16:9 aspect ratio to match training
+    camera_fps: int = 30
     
     # Home position for arm (6 DOF) - adjust to your setup
     arm_home: tuple = (0.0, -1.52, 0.349, -1.54, -1.16, 2.47)
@@ -219,21 +226,78 @@ class Revo2Hand:
 
 
 class Camera:
-    """Camera interface placeholder."""
+    """
+    Orbbec camera interface for RGB image capture.
     
-    def __init__(self):
+    Uses pyorbbecsdk to capture frames from Orbbec cameras (e.g., Gemini 336).
+    Only captures RGB - simplified from the full multi_streams.py implementation.
+    """
+    
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.pipeline = None
+        self._connected = False
         
     def connect(self) -> bool:
-        """Connect to camera."""
-        # TODO: Implement your camera connection
-        # Example: Orbbec, RealSense, or USB camera
-        print("[CAMERA] Using placeholder (implement your camera)")
-        return True
+        """Connect to Orbbec camera and start RGB stream."""
+        try:
+            from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
+            
+            print(f"[CAMERA] Connecting to Orbbec camera ({self.width}x{self.height} @ {self.fps}fps)...")
+            
+            self.pipeline = Pipeline()
+            config = Config()
+            
+            # Configure color stream only (we just need RGB for policy)
+            try:
+                color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+                # Try to get requested resolution, fall back to what's available
+                color_profile = color_profiles.get_video_stream_profile(
+                    self.width, self.height, OBFormat.RGB, self.fps
+                )
+                config.enable_stream(color_profile)
+                print(f"[CAMERA] Using profile: {self.width}x{self.height} RGB @ {self.fps}fps")
+            except Exception as e:
+                print(f"[CAMERA] Warning: Could not get exact profile, trying defaults: {e}")
+                # Try common fallback resolutions
+                for res in [(1280, 720), (640, 480), (320, 240)]:
+                    try:
+                        color_profile = color_profiles.get_video_stream_profile(
+                            res[0], res[1], OBFormat.RGB, 30
+                        )
+                        config.enable_stream(color_profile)
+                        self.width, self.height = res
+                        print(f"[CAMERA] Using fallback profile: {res[0]}x{res[1]} RGB @ 30fps")
+                        break
+                    except:
+                        continue
+            
+            self.pipeline.start(config)
+            self._connected = True
+            print("[CAMERA] Connected successfully")
+            return True
+            
+        except ImportError:
+            print("[CAMERA] pyorbbecsdk not available - using dummy camera")
+            self._connected = False
+            return True  # Return True to allow validation to continue with dummy data
+            
+        except Exception as e:
+            print(f"[CAMERA] Connection failed: {e}")
+            self._connected = False
+            return False
     
     def disconnect(self):
-        """Disconnect from camera."""
-        pass
+        """Stop camera pipeline."""
+        if self.pipeline:
+            try:
+                self.pipeline.stop()
+                print("[CAMERA] Disconnected")
+            except Exception as e:
+                print(f"[CAMERA] Disconnect error: {e}")
+        self._connected = False
     
     def get_frame(self) -> np.ndarray:
         """
@@ -241,12 +305,75 @@ class Camera:
         
         Returns:
             np.ndarray: RGB image (H, W, 3) uint8
-            
-        TODO: Implement with your actual camera.
         """
-        # Placeholder: return random image
-        # Replace with actual camera capture
-        return np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        if not self._connected or self.pipeline is None:
+            # Return dummy frame if not connected
+            return np.random.randint(0, 255, (self.height, self.width, 3), dtype=np.uint8)
+        
+        try:
+            # Wait for frames with 100ms timeout
+            frames = self.pipeline.wait_for_frames(100)
+            if not frames:
+                print("[CAMERA] No frames received")
+                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                print("[CAMERA] No color frame")
+                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            
+            # Convert frame to RGB numpy array
+            rgb_image = self._frame_to_rgb(color_frame)
+            return rgb_image
+            
+        except Exception as e:
+            print(f"[CAMERA] Error getting frame: {e}")
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+    
+    def _frame_to_rgb(self, frame) -> np.ndarray:
+        """
+        Convert Orbbec frame to RGB numpy array.
+        
+        Simplified version of frame_to_bgr_image from motion_retargeting.
+        """
+        try:
+            from pyorbbecsdk import OBFormat
+            import cv2
+            
+            width = frame.get_width()
+            height = frame.get_height()
+            color_format = frame.get_format()
+            data = np.asanyarray(frame.get_data())
+            
+            if color_format == OBFormat.RGB:
+                # Already RGB, just reshape
+                image = np.resize(data, (height, width, 3))
+                return image.astype(np.uint8)
+                
+            elif color_format == OBFormat.BGR:
+                # Convert BGR to RGB
+                image = np.resize(data, (height, width, 3))
+                return cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.uint8)
+                
+            elif color_format == OBFormat.MJPG:
+                # Decode MJPEG
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if image is not None:
+                    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.uint8)
+                    
+            elif color_format == OBFormat.YUYV:
+                image = np.resize(data, (height, width, 2))
+                bgr = cv2.cvtColor(image, cv2.COLOR_YUV2BGR_YUYV)
+                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+            
+            # Fallback: try to interpret as RGB
+            print(f"[CAMERA] Unknown format {color_format}, attempting raw conversion")
+            image = np.resize(data, (height, width, 3))
+            return image.astype(np.uint8)
+            
+        except Exception as e:
+            print(f"[CAMERA] Frame conversion error: {e}")
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
 
 # =============================================================================
@@ -392,7 +519,7 @@ def main(args: Args) -> None:
         arm.disconnect()
         return
     
-    camera = Camera()
+    camera = Camera(width=args.camera_width, height=args.camera_height, fps=args.camera_fps)
     if not camera.connect():
         print("[ERROR] Failed to connect to camera")
         arm.disconnect()
@@ -404,7 +531,7 @@ def main(args: Args) -> None:
     # 3. Warm up policy (first inference is slow)
     print("\nWarming up policy...")
     dummy_obs = {
-        "observation/image": np.zeros((480, 640, 3), dtype=np.uint8),
+        "observation/image": np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8),
         "observation/state": np.zeros(12, dtype=np.float32),
         "prompt": args.default_prompt,
     }
