@@ -358,13 +358,13 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 @dataclasses.dataclass(frozen=True)
 class LeRobotAirBotDataConfig(DataConfigFactory):
     """
-    Config for AirBot Play (6-DOF arm + 6-DOF Revo2 hand).
+    Config for AirBot Play (6-DOF arm + gripper).
     
-    This config processes data from the test_pi_finetune LeRobot dataset for training.
+    This config processes data from the ethansan01/airbot_v2 LeRobot dataset for training.
     AirBot has a single top-down camera and 12 action dimensions (6 arm + 6 hand).
     """
     
-    repo_id: str = "test_pi_finetune"
+    repo_id: str = "ethansan01/airbot_v2"
     
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -389,8 +389,8 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
         )
         
         # AirBot actions are absolute joint positions, convert to deltas
-        # All 12 dimensions (6 arm + 6 hand) use delta actions
-        delta_action_mask = _transforms.make_bool_mask(12)
+        # All 7 dimensions (6 arm + gripper) use delta actions
+        delta_action_mask = _transforms.make_bool_mask(7)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -398,7 +398,7 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
         
         # Model transforms (standard, no changes needed)
         # Use default_prompt to inject prompt if task lookup fails
-        model_transforms = ModelTransformFactory(default_prompt="Pick up the ball and put it in the box")(model_config)
+        model_transforms = ModelTransformFactory(default_prompt="Pick up the bottle and put it in the box")(model_config)
         
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -1028,7 +1028,7 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=500,
             peak_lr=3e-5,  # LoRA learning rate
-            decay_steps=20_000,
+            decay_steps=30_000,
         ),
         optimizer=_optimizer.AdamW(weight_decay=0.01),
         ema_decay=0.99,
@@ -1037,7 +1037,7 @@ _CONFIGS = [
         ),
         batch_size=4,  # Reduce batch size for memory
         num_workers=4,
-        num_train_steps=20_000,
+        num_train_steps=30_000,
         save_interval=5_000,
     ),
     TrainConfig(

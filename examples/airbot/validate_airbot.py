@@ -14,7 +14,7 @@ Usage:
     cd ~/openpi
     uv run scripts/serve_policy.py policy:checkpoint \
         --policy.config=airbot_pi05 \
-        --policy.dir=checkpoints/airbot_pi05/20000
+        --policy.dir=checkpoints/airbot_pi05/airbot_v1/20000
 
     # Terminal 2: Run this validation script (in conda env with robot deps)
     conda activate your_robot_env
@@ -30,12 +30,19 @@ Requirements (in conda env):
 
 import dataclasses
 import logging
+import sys
 import time
+from pathlib import Path
 from typing import Optional
+import rerun as rr
 
 import numpy as np
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tyro
+
+# Add openpi root to Python path for revo2_library imports
+openpi_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(openpi_root))
 
 # =============================================================================
 # Robot imports from motion_retargeting
@@ -71,27 +78,27 @@ class Args:
     port: int = 8000
     
     # Robot configuration
-    arm_port: str = "50000"  # AirBot serial port or IP
-    hand_port: str = "/dev/ttyUSB1"  # Revo2 hand port
+    arm_port: str = "50001"  # AirBot serial port or IP
+    hand_port: str = "/dev/ttyUSB0"  # Revo2 hand port
     
     # Rollout parameters
     num_episodes: int = 5
-    max_episode_steps: int = 600  # ~20 seconds at 30 Hz
+    max_episode_steps: int = 3000  # ~20 seconds at 30 Hz
     control_freq: int = 30  # Hz
-    action_horizon: int = 8  # Execute N actions before re-querying policy
+    action_horizon: int = 15  # Execute N actions before re-querying policy
     
     # Camera configuration (Orbbec)
     # NOTE: Should match aspect ratio used during training for best results
     # Training used 320x180 (16:9), so we capture at same aspect ratio
-    camera_width: int = 640   # Will be resized by policy server
-    camera_height: int = 360  # 16:9 aspect ratio to match training
+    camera_width: int = 1280   # Will be resized by policy server
+    camera_height: int = 720  # 16:9 aspect ratio to match training
     camera_fps: int = 30
     
     # Home position for arm (6 DOF) - adjust to your setup
-    arm_home: tuple = (0.0, -1.52, 0.349, -1.54, -1.16, 2.47)
+    arm_home: tuple = (-0.681, -2.37, 0.7, -2.26, -1.5, 0.783)
     
     # Prompts
-    default_prompt: str = "pick up the object"
+    default_prompt: str = "pick up the ball and place it in the box"
 
 
 # =============================================================================
@@ -161,7 +168,7 @@ class AirBotArm:
             self.robot.switch_mode(RobotMode.PLANNING_POS)
             self.robot.set_speed_profile(SpeedProfile.SLOW)
             self.robot.move_to_joint_pos(joint_pos=list(home_pos), blocking=blocking)
-            self.robot.set_speed_profile(SpeedProfile.FAST)
+            self.robot.set_speed_profile(SpeedProfile.SLOW)
             self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
         except Exception as e:
             print(f"[ARM] Error moving to home: {e}")
@@ -186,18 +193,31 @@ class Revo2Hand:
     # Joint limits for mapping (radians)
     JOINT_LIMITS = [1.57, 1.03, 1.41, 1.41, 1.41, 1.41]
     
-    def __init__(self, port: str, side: str = "right"):
+    def __init__(self, port: str, side: str = "left"):
         self.port = port if port != "/dev/ttyUSB1" else None  # None = auto-detect
         self.side = side
         self.client = None
         self.slave_id = None
         self._connected = False
+        self._event_loop = None
+        self._loop_thread = None
         
     def connect(self) -> bool:
         """Connect to Revo2 hand via Modbus."""
         if not REVO2_AVAILABLE:
             print("[HAND] Using dummy hand (revo2 library not available)")
             return True
+        
+        import threading
+        
+        def run_event_loop(loop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        
+        # Create persistent event loop
+        self._event_loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=run_event_loop, args=(self._event_loop,), daemon=True)
+        self._loop_thread.start()
         
         async def _connect_async():
             try:
@@ -226,7 +246,8 @@ class Revo2Hand:
                 return False
         
         try:
-            return asyncio.run(_connect_async())
+            future = asyncio.run_coroutine_threadsafe(_connect_async(), self._event_loop)
+            return future.result(timeout=5.0)
         except Exception as e:
             print(f"[HAND] Failed to connect: {e}")
             self._connected = False
@@ -236,10 +257,7 @@ class Revo2Hand:
         """Disconnect from hand."""
         if self.client:
             try:
-                async def _disconnect_async():
-                    libstark.modbus_close(self.client)
-                    await asyncio.sleep(0.1)
-                asyncio.run(_disconnect_async())
+                libstark.modbus_close(self.client)
                 print("[HAND] Disconnected")
             except Exception as e:
                 print(f"[HAND] Disconnect error: {e}")
@@ -247,6 +265,13 @@ class Revo2Hand:
                 self.client = None
                 self.slave_id = None
                 self._connected = False
+        
+        if self._event_loop:
+            self._event_loop.call_soon_threadsafe(self._event_loop.stop)
+            if self._loop_thread and self._loop_thread.is_alive():
+                self._loop_thread.join(timeout=1.0)
+            self._event_loop = None
+            self._loop_thread = None
     
     def get_joint_positions(self) -> np.ndarray:
         """
@@ -267,12 +292,11 @@ class Revo2Hand:
                 return [0] * 6
         
         try:
-            positions = asyncio.run(_get_positions_async())
-            # Convert from normalized (0-1000) to radians
+            future = asyncio.run_coroutine_threadsafe(_get_positions_async(), self._event_loop)
+            positions = future.result(timeout=0.05)
             radians = self._revo2_to_radians(positions)
             return np.array(radians, dtype=np.float32)
         except Exception as e:
-            print(f"[HAND] Failed to get positions: {e}")
             return np.zeros(6, dtype=np.float32)
     
     def set_joint_positions(self, positions: np.ndarray):
@@ -291,8 +315,8 @@ class Revo2Hand:
         
         # Convert from radians to normalized (0-1000)
         revo2_positions = self._radians_to_revo2(positions)
-        speeds = [1000] * 6  # Max speed for responsiveness
-        
+        speeds = [1000] * 6
+    
         async def _set_positions_async():
             try:
                 await self.client.set_finger_positions_and_speeds(
@@ -304,9 +328,9 @@ class Revo2Hand:
                 print(f"[HAND] Error setting positions: {e}")
         
         try:
-            asyncio.run(_set_positions_async())
+            asyncio.run_coroutine_threadsafe(_set_positions_async(), self._event_loop)
         except Exception as e:
-            print(f"[HAND] Failed to set positions: {e}")
+            print(f"[HAND] Failed to execute set_joint_positions: {e}")
     
     def set_open(self):
         """Open all fingers."""
@@ -451,7 +475,9 @@ class Camera:
                 return np.zeros((self.height, self.width, 3), dtype=np.uint8)
             
             # Convert frame to RGB numpy array
+
             rgb_image = self._frame_to_rgb(color_frame)
+            rr.log("camera/rgb", rr.Image(rgb_image), static=True)
             return rgb_image
             
         except Exception as e:
@@ -548,6 +574,12 @@ def run_episode(
             hand_joints = hand.get_joint_positions()
             state = np.concatenate([arm_joints, hand_joints]).astype(np.float32)
             
+            # Debug current state every 20 steps
+            if step % 20 == 0:
+                print(f"\n[STEP {step}] Current state:")
+                print(f"  Arm joints:  {arm_joints.round(3)}")
+                print(f"  Hand joints: {hand_joints.round(3)}")
+            
             # 2. Build observation dict for policy
             observation = {
                 "observation/image": image,
@@ -558,6 +590,14 @@ def run_episode(
             # 3. Query policy
             result = policy.infer(observation)
             actions = result["actions"]  # Shape: (N, 12)
+            
+            # Debug: log actions every 20 steps
+            if step % 20 == 0:
+                print(f"  Policy actions (first):")
+                print(f"    Arm target:  {actions[0][:6].round(3)}")
+                print(f"    Hand target: {actions[0][6:].round(3)}")
+                print(f"    Action delta arm:  {(actions[0][:6] - arm_joints).round(3)}")
+                print(f"    Action delta hand: {(actions[0][6:] - hand_joints).round(3)}")
             
             # 4. Execute action chunk (open-loop)
             for i in range(min(args.action_horizon, len(actions))):
@@ -618,7 +658,7 @@ def run_episode(
 
 def main(args: Args) -> None:
     """Main validation loop."""
-    
+    rr.init("airbot_validation", spawn=True)
     print("=" * 70)
     print("AirBot + Revo2 Hand Policy Validation")
     print("=" * 70)
@@ -655,6 +695,103 @@ def main(args: Args) -> None:
         return
     
     print("[ROBOT] All hardware initialized")
+    
+    # Quick hardware test
+    print("\n" + "="*70)
+    print("HARDWARE TEST")
+    print("="*70)
+    print("Testing hardware connections...")
+    
+    # Test arm - read position
+    try:
+        arm_pos = arm.get_joint_positions()
+        print(f"[ARM] Current position: {arm_pos}")
+        print(f"[ARM] ✓ Reading positions successfully")
+    except Exception as e:
+        print(f"[ARM] ✗ Error reading positions: {e}")
+    
+    # Test hand - read position
+    try:
+        hand_pos = hand.get_joint_positions()
+        print(f"[HAND] Current position: {hand_pos}")
+        print(f"[HAND] ✓ Reading positions successfully")
+    except Exception as e:
+        print(f"[HAND] ✗ Error reading positions: {e}")
+    
+    # Test camera
+    try:
+        frame = camera.get_frame()
+        print(f"[CAMERA] Frame shape: {frame.shape}")
+        print(f"[CAMERA] ✓ Capturing frames successfully")
+    except Exception as e:
+        print(f"[CAMERA] ✗ Error capturing frame: {e}")
+    
+    print("="*70)
+    print("Review the hardware test results above.")
+    print("="*70)
+    
+    # Interactive movement tests
+    print("\n" + "="*70)
+    print("INTERACTIVE HARDWARE MOVEMENT TEST")
+    print("="*70)
+    print("This will test actual hardware movements.")
+    print("Make sure the robot has clear space to move safely!")
+    print()
+    
+    proceed = input("Proceed with movement test? [y/n]: ").strip().lower()
+    if proceed == 'y':
+        # Test 1: Move arm to home position
+        print("\n[TEST 1/3] Moving arm to home position...")
+        print(f"[ARM] Target home position: {args.arm_home}")
+        try:
+            arm.move_to_home(args.arm_home, blocking=True)
+            print("[ARM] ✓ Successfully moved to home position")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[ARM] ✗ Error moving to home: {e}")
+        
+        # Test 2: Open hand
+        print("\n[TEST 2/3] Opening hand...")
+        try:
+            hand.set_open()
+            print("[HAND] Command sent: OPEN")
+            time.sleep(2.0)  # Give time to observe movement
+            hand_pos = hand.get_joint_positions()
+            print(f"[HAND] Position after open: {hand_pos}")
+            print("[HAND] ✓ Open command executed")
+        except Exception as e:
+            print(f"[HAND] ✗ Error opening hand: {e}")
+        
+        # Test 3: Close hand
+        print("\n[TEST 3/3] Closing hand...")
+        try:
+            hand.set_closed()
+            print("[HAND] Command sent: CLOSED")
+            time.sleep(2.0)  # Give time to observe movement
+            hand_pos = hand.get_joint_positions()
+            print(f"[HAND] Position after close: {hand_pos}")
+            print("[HAND] ✓ Close command executed")
+        except Exception as e:
+            print(f"[HAND] ✗ Error closing hand: {e}")
+        
+        # Return to open
+        print("\n[CLEANUP] Returning hand to open position...")
+        try:
+            hand.set_open()
+            time.sleep(1.0)
+            print("[HAND] ✓ Hand returned to open")
+        except Exception as e:
+            print(f"[HAND] ✗ Error in cleanup: {e}")
+        
+        print("\n" + "="*70)
+        print("Movement test complete!")
+        print("="*70)
+    else:
+        print("\nSkipping movement test.")
+    
+    print("\nIf everything looks good, press Enter to start validation...")
+    print("Otherwise, press Ctrl+C to exit and fix issues.")
+    input()
     
     # 3. Warm up policy (first inference is slow)
     print("\nWarming up policy...")

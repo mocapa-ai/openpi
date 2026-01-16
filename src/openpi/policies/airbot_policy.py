@@ -157,6 +157,6 @@ class AirBotOutputs(transforms.DataTransformFn):
         # Action layout:
         # [0:6]   - arm joint positions/velocities
         # [6:12]  - hand (Revo2) joint positions/velocities
-        airbot_actions = np.asarray(data["actions"][:, :12])
+        airbot_actions = np.asarray(data["actions"][:, :7])
         
         return {"actions": airbot_actions}

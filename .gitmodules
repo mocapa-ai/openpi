@@ -4,3 +4,6 @@
 [submodule "third_party/libero"]
 	path = third_party/libero
 	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "revo2_library"]
+	path = revo2_library
+	url = https://github.com/Luthov/stark-serialport-example-mocapa.git
