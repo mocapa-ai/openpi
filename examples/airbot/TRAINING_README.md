@@ -70,20 +70,19 @@ cd ~/openpi
 # 1. Convert aligned HDF5 → LeRobot dataset
 uv run examples/airbot/convert_aligned_to_lerobot.py \
     --data_dir ~/data_factory/motion_retargeting/aligned_demos \
-    --output_name "myusername/airbot_picking" \
-    --fps 30
+    --output_name "myusername/airbot_picking" 
 
 # 2. Verify dataset (optional but recommended)
 uv run examples/airbot/verify_dataset_for_pi05.py "myusername/airbot_picking"
 
-# 3. Compute normalization stats (REQUIRED - one time only)
-uv run python -m lerobot.scripts.compute_stats \
-    --repo-id "myusername/airbot_picking"
+# 3. Compute normalization stats
+uv run scripts/compute_norm_stats.py --config-name airbot_pi05
+
 
 # 4. Train Pi0.5 with LoRA
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py airbot_pi05 \
     --exp-name=my_first_run \
-    --overwrite
+    --overwrite (if you are training the same thing again and want to overwrite the checkpoints)
 ```
 
 ---
@@ -150,8 +149,7 @@ uv run examples/airbot/convert_aligned_to_lerobot.py \
 # Convert all aligned demos from data_factory
 uv run examples/airbot/convert_aligned_to_lerobot.py \
     --data_dir ~/data_factory/motion_retargeting/aligned_pi \
-    --output_name "ethan/cube_picking_v1" \
-    --fps 10
+    --output_name "ethansan01/cube_picking_v1" 
 
 # Expected output:
 # Found 48 HDF5 files to convert
@@ -169,25 +167,6 @@ uv run examples/airbot/convert_aligned_to_lerobot.py \
 
 ## Step 2: Verify Dataset
 
-### 2.1 Quick Verification
-
-Use the verification script for a quick check:
-
-```bash
-cd ~/openpi
-
-uv run examples/airbot/verify_lerobot.py "myusername/dataset_name"
-
-# Output shows:
-# - Dataset location
-# - File structure
-# - Episode count and frame count
-# - Feature dimensions
-# - Sample frame data
-```
-
-### 2.2 Comprehensive Verification
-
 For detailed validation before training:
 
 ```bash
@@ -203,25 +182,8 @@ uv run examples/airbot/verify_dataset_for_pi05.py \
 # 3. Has sufficient episodes and frames
 # 4. Has required features (state, actions, image)
 # 5. Data validation (no NaN, reasonable ranges)
-# 6. Cross-episode consistency
 ```
 
-### 2.3 What to Look For
-
-The verification script will report:
-
-**Critical Requirements** (must pass):
-- [x] Dataset exists and loads
-- [x] Has `state` feature (12D for arm+hand positions)
-- [x] Has `actions` feature (12D for arm+hand actions)
-- [x] Has at least one camera feature (`image`)
-- [x] Has language instructions (`task` field)
-
-**Recommended** (warnings if not met):
-- [x] At least 1000 frames total
-- [x] At least 10 episodes
-- [x] No NaN or Inf values in data
-- [x] Consistent dimensions across episodes
 
 ---
 
@@ -272,29 +234,18 @@ class LeRobotAirBotDataConfig(BaseDataConfig):
     state_dim: int = 12  # 6 arm + 6 hand
     action_dim: int = 12
     
-    # Action conversion
-    absolute_actions: bool = True  # AirBot uses absolute positions
-    # During training: converts to deltas
-    # During inference: integrates deltas back to absolute
 ```
 
 ### 3.3 Training Configurations
 
-Three configs are available in `config.py`:
 
-1. **`airbot_pi05`** (Recommended)
+1. **`airbot_pi05`** 
    - LoRA fine-tuning
    - Batch size: 32
    - Learning rate: 3e-5
    - Steps: 20,000
    - GPU memory: ~22GB
 
-2. **`airbot_pi05_full`** (Not implemented)
-   - Full model fine-tuning
-   - Higher GPU requirements (~70GB)
-   - Better for large datasets (10,000+ frames)
-
----
 
 ## Step 4: Training Configuration
 
@@ -311,7 +262,7 @@ uv run scripts/train.py airbot_pi05 \
 
 ### 4.2 Hyperparameter Tuning
 
-Key parameters you might want to adjust:
+Key parameters to adjust:
 
 ```bash
 # Adjust learning rate
@@ -333,7 +284,6 @@ See all options: `uv run scripts/train.py airbot_pi05 --help`
 
 ## Step 5: Compute Normalization Stats
 
-**CRITICAL STEP**: Must be done once before training.
 
 ### 5.1 Why Normalization Stats?
 
@@ -368,7 +318,7 @@ uv run scripts/compute_norm_stats.py --config-name airbot_pi05
 ```bash
 cd ~/openpi
 
-# Set GPU memory allocation (prevents OOM errors)
+# Set GPU memory allocation 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 
 # Start training
