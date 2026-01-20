@@ -65,8 +65,8 @@ def main(args: Args):
     
     # Create random observation (matching your robot specs)
     dummy_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    dummy_state = np.random.randn(12).astype(np.float32)  # 6 arm + 6 hand
-    dummy_prompt = "pick up the ball and put it in the box"
+    dummy_state = np.random.randn(7).astype(np.float32)  # 6 arm + 6 hand
+    dummy_prompt = "pick up the bottle and put it in the box"
     
     observation = {
         "observation/image": dummy_image,
@@ -108,7 +108,7 @@ def main(args: Args):
     print(f"  Action shape: {actions.shape}")
     
     # Expected shape: (10, 12) - 10 timesteps, 12 DOF
-    expected_shape = (10, 12)
+    expected_shape = (15, 7)
     if actions.shape != expected_shape:
         print(f"  ❌ Unexpected action shape!")
         print(f"    Expected: {expected_shape}")
@@ -138,7 +138,7 @@ def main(args: Args):
     # Show first action
     print(f"\n  First action (timestep 0):")
     print(f"    Arm joints  [0:6]:  {actions[0, :6]}")
-    print(f"    Hand joints [6:12]: {actions[0, 6:12]}")
+    print(f"    Hand joints [6:7]: {actions[0, 6:7]}")
     
     # =========================================================================
     # Test 5: Multiple Queries
@@ -151,7 +151,7 @@ def main(args: Args):
             # Slightly different observation each time
             obs = {
                 "observation/image": np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8),
-                "observation/state": np.random.randn(12).astype(np.float32),
+                "observation/state": np.random.randn(7).astype(np.float32),
                 "prompt": dummy_prompt,
             }
             result = policy.infer(obs)
