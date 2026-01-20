@@ -75,7 +75,7 @@ class Args:
     # Rollout parameters
     num_episodes: int = 5
     max_episode_steps: int = 3000  # ~20 seconds at 30 Hz
-    control_freq: int = 30  # Hz
+    control_freq: int = 10  # Hz
     action_horizon: int = 15  # Execute N actions before re-querying policy
     
     # Camera configuration (Orbbec)
@@ -404,20 +404,28 @@ def run_episode(
             # 3. Query policy
             result = policy.infer(observation)
             actions = result["actions"]  # Shape: (N, 7)
+            print(f"[EPISODE] Policy returned {len(actions)} actions")
+            
             
             
             # 4. Execute action chunk (open-loop)
             for i in range(min(args.action_horizon, len(actions))):
-                delta_action = actions[i]
-                
+                action = actions[i]
+                print(f"[EPISODE] action list: {action}")
                 # Split action into arm and hand
-                arm_action = arm_joints + delta_action[:6]
-                gripper_action = gripper_position + delta_action[6:7]
+                arm_action = action[0:6]
+                gripper_action = action[6:7]
                 
                 # Execute
-                
-                arm.set_joint_positions(arm_action)
-                arm.set_gripper_position(gripper_action)
+                safe_arm_action = np.clip(arm_action[2], 0.0, 3.14)
+                safe_arm_action_4 = np.clip(arm_action[4], -1.75, 2.0)
+                new_arm_action = arm_action.copy()
+                new_arm_action[2] = safe_arm_action
+                new_arm_action[4] = safe_arm_action_4
+                new_gripper_action = abs(gripper_action)
+                print(f"[EPISODE] Executing arm action: {new_arm_action}, gripper action: {new_gripper_action}")
+                arm.set_joint_positions(new_arm_action)
+                arm.set_gripper_position(new_gripper_action)
                 
                 # Maintain control frequency
                 elapsed = time.time() - step_start
@@ -553,7 +561,7 @@ def main(args: Args) -> None:
     print("\nWarming up policy...")
     dummy_obs = {
         "observation/image": np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8),
-        "observation/state": np.zeros(12, dtype=np.float32),
+        "observation/state": np.zeros(7, dtype=np.float32),
         "prompt": args.default_prompt,
     }
     for _ in range(2):
