@@ -71,8 +71,7 @@ class Args:
     
     # Robot configuration
     arm_port: str = "50001"  # AirBot serial port or IP
-    hand_port: str = "/dev/ttyUSB0"  # Revo2 hand port
-    
+
     # Rollout parameters
     num_episodes: int = 5
     max_episode_steps: int = 3000  # ~20 seconds at 30 Hz
@@ -87,10 +86,10 @@ class Args:
     camera_fps: int = 30
     
     # Home position for arm (6 DOF) - adjust to your setup
-    arm_home: tuple = (-0.681, -2.37, 0.7, -2.26, -1.5, 0.783)
+    arm_home: tuple = (0, -1.52, 0.123, -1.54, -1.16, -0.632)
     
     # Prompts
-    default_prompt: str = "pick up the ball and place it in the box"
+    default_prompt: str = "pick up the bottle and place it in the box"
 
 
 # =============================================================================
@@ -151,26 +150,34 @@ class AirBotArm:
         except Exception as e:
             print(f"[ARM] Error setting positions: {e}")
     
-    def get_gripper_position(self) -> float:
-        """Get current gripper position (single DOF)."""
-        if not self.robot:
-            return 0.0
-        try:
-            gripper_pos = self.robot.get_eef_pos()
-            return float(gripper_pos)
-        except Exception as e:
-            print(f"[ARM] Error reading gripper position: {e}")
-            return 0.0
-    
-    def set_gripper_position(self, position: float):    
+    def set_gripper_position(self, position):    
         """Set gripper position (single DOF)."""
         if not self.robot:
             return
         try:
+            # 1. If it's a numpy type, convert to python type (float or list)
+            if hasattr(position, 'tolist'):
+                position = position.tolist()
+                
+            # 2. If it is now a single float/int, wrap it in a list
+            if not isinstance(position, list):
+                position = [position]
+                
             self.robot.servo_eef_pos(position)
         except Exception as e:
             print(f"[ARM] Error setting gripper position: {e}")
     
+    def get_gripper_position(self):
+        """Get current gripper position (single DOF)."""
+        if not self.robot:
+            return np.zeros(1, dtype=np.float32)
+        try:
+            pos = self.robot.get_eef_pos()
+            return np.array(pos, dtype=np.float32)
+        except Exception as e:
+            print(f"[ARM] Error reading gripper position: {e}")
+            return np.zeros(1, dtype=np.float32)
+        
     def move_to_home(self, home_pos: tuple, blocking: bool = True):
         """Move arm to home position."""
         if not self.robot:
@@ -184,6 +191,7 @@ class AirBotArm:
             self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
         except Exception as e:
             print(f"[ARM] Error moving to home: {e}")
+
 
 
 
@@ -366,7 +374,7 @@ def run_episode(
     # Move to home position
     print("[EPISODE] Moving to home position...")
     arm.move_to_home(args.arm_home, blocking=True)
-    arm.set_gripper_position(0.067)
+    arm.set_gripper_position(0.0)  # Close gripper
     time.sleep(1.0)
     
     input("Press Enter when ready to start...")
@@ -377,19 +385,15 @@ def run_episode(
     try:
         for step in range(args.max_episode_steps):
             step_start = time.time()
+
             
             # 1. Get observation
             image = camera.get_frame()
             arm_joints = arm.get_joint_positions()
-            gripper_pos = arm.get_gripper_position()
-            state = np.concatenate([arm_joints, gripper_pos]).astype(np.float32)
+            gripper_position = arm.get_gripper_position()
+            state = np.concatenate([arm_joints, gripper_position]).astype(np.float32)
             
-            # Debug current state every 20 steps
-            if step % 20 == 0:
-                print(f"\n[STEP {step}] Current state:")
-                print(f"  Arm joints:  {arm_joints}")
-                print(f"  Gripper position: {gripper_pos}")
-            
+
             # 2. Build observation dict for policy
             observation = {
                 "observation/image": image,
@@ -404,13 +408,14 @@ def run_episode(
             
             # 4. Execute action chunk (open-loop)
             for i in range(min(args.action_horizon, len(actions))):
-                action = actions[i]
+                delta_action = actions[i]
                 
                 # Split action into arm and hand
-                arm_action = action[:6]
-                gripper_action = action[6:7]
+                arm_action = arm_joints + delta_action[:6]
+                gripper_action = gripper_position + delta_action[6:7]
                 
                 # Execute
+                
                 arm.set_joint_positions(arm_action)
                 arm.set_gripper_position(gripper_action)
                 
@@ -507,7 +512,6 @@ def main(args: Args) -> None:
         print(f"[ARM] ✓ Reading positions successfully")
     except Exception as e:
         print(f"[ARM] ✗ Error reading positions: {e}")
-    
     # Test camera
     try:
         frame = camera.get_frame()
@@ -535,19 +539,11 @@ def main(args: Args) -> None:
         print(f"[ARM] Target home position: {args.arm_home}")
         try:
             arm.move_to_home(args.arm_home, blocking=True)
-            arm.set_gripper_position(0.0)
             print("[ARM] ✓ Successfully moved to home position")
             time.sleep(0.5)
-            arm.set_gripper_position(0.067)
-
         except Exception as e:
             print(f"[ARM] ✗ Error moving to home: {e}")
 
-        print("\n" + "="*70)
-        print("Movement test complete!")
-        print("="*70)
-    else:
-        print("\nSkipping movement test.")
     
     print("\nIf everything looks good, press Enter to start validation...")
     print("Otherwise, press Ctrl+C to exit and fix issues.")
@@ -557,7 +553,7 @@ def main(args: Args) -> None:
     print("\nWarming up policy...")
     dummy_obs = {
         "observation/image": np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8),
-        "observation/state": np.zeros(7, dtype=np.float32),
+        "observation/state": np.zeros(12, dtype=np.float32),
         "prompt": args.default_prompt,
     }
     for _ in range(2):
