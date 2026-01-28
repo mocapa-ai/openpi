@@ -95,8 +95,9 @@ class AirBotInputs(transforms.DataTransformFn):
                 - "prompt": language instruction
         """
         # Parse image to uint8 (H, W, C) format
-        # AirBot has a single top-down camera view
-        image = _parse_image(data["observation/image"])
+        # AirBot has a single top-down camera view and a wrist camera view
+        base_image = _parse_image(data["observation/image"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
         
         # Create model inputs dict
         # Model expects 3 camera views, so we use the same image for all
@@ -104,13 +105,13 @@ class AirBotInputs(transforms.DataTransformFn):
         inputs = {
             "state": data["observation/state"],
             "image": {
-                "base_0_rgb": image,  # Primary third-person view
-                "left_wrist_0_rgb": np.zeros_like(image),  # No wrist camera
-                "right_wrist_0_rgb": np.zeros_like(image),  # No additional camera
+                "base_0_rgb": base_image,  # Primary third-person view
+                "left_wrist_0_rgb": wrist_image,  # Wrist camera
+                "right_wrist_0_rgb": np.zeros_like(base_image),  # No additional camera
             },
             "image_mask": {
                 "base_0_rgb": np.True_,  # Always present
-                "left_wrist_0_rgb": np.False_,  # Not available
+                "left_wrist_0_rgb": np.True_,  # Wrist camera present
                 "right_wrist_0_rgb": (
                     np.True_ if self.model_type == _model.ModelType.PI0_FAST
                     else np.False_

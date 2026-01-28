@@ -7,10 +7,10 @@ and ready for OpenPI/Pi0.5 training.
 
 Usage:
     cd ~/openpi
-    uv run python examples/custom_robot/verify_dataset_for_pi05.py your_username/robot_dataset
+    uv run python examples/airbot/verify_dataset_for_pi05.py your_username/robot_dataset
     
     # With visualization
-    uv run python examples/custom_robot/verify_dataset_for_pi05.py your_username/robot_dataset --visualize
+    uv run python examples/airbot/verify_dataset_for_pi05.py your_username/robot_dataset --visualize
 """
 
 import argparse
@@ -149,15 +149,18 @@ def verify_dataset(dataset_name: str, visualize: bool = False):
         return False
     
     # Check camera features
-    camera_features = [k for k in dataset.features.keys() 
-                      if 'camera' in k.lower() or 'image' in k.lower() or k == 'top']
-    
+    # Detect camera/image features. New converter creates `image_<camera>`
+    # keys (e.g., image_top, image_wrist). Accept legacy 'image' or any
+    # feature containing 'image' or 'camera'.
+    camera_features = [k for k in dataset.features.keys()
+                       if k.lower().startswith('image_') or 'image' in k.lower() or 'camera' in k.lower()]
+
     if not camera_features:
-        print(f"[ERROR] No camera features found!")
-        print(f"   Pi0.5 requires at least one camera view")
+        print(f"[ERROR] No camera/image features found!")
+        print(f"   Pi0.5 requires at least one camera view (e.g. image_top or image_wrist)")
         return False
-    
-    print(f"\n[OK] Found {len(camera_features)} camera feature(s): {camera_features}")
+
+    print(f"\n[OK] Found {len(camera_features)} camera/image feature(s): {camera_features}")
     
     # ===== Check 5: Data validation =====
     print_section("CHECK 5: Data Validation")
@@ -233,7 +236,7 @@ def verify_dataset(dataset_name: str, visualize: bool = False):
                 print(f"     State: {state_shape}")
                 print(f"     Actions: {actions_shape}")
         
-        # Check cameras
+        # Check cameras (support multiple views like image_top, image_wrist)
         for cam_name in camera_features:
             if cam_name in sample:
                 image = sample[cam_name]
@@ -280,7 +283,9 @@ def verify_dataset(dataset_name: str, visualize: bool = False):
                 if visualize:
                     try:
                         import matplotlib.pyplot as plt
-                        output_path = f"verify_{cam_name}_sample.png"
+                        # Name file with dataset and camera to avoid collisions
+                        safe_cam = cam_name.replace('/', '_')
+                        output_path = f"verify_{safe_cam}_sample.png"
                         plt.figure(figsize=(8, 6))
                         if image_np_vis.shape[-1] == 1:
                             # Grayscale
@@ -388,7 +393,7 @@ def verify_dataset(dataset_name: str, visualize: bool = False):
         else:
             print(f"  1. Stats already computed [OK]")
         print(f"  2. Start training:")
-        print(f"     uv run scripts/train.py custom_robot_pi05 --exp-name=my_experiment")
+        print(f"     uv run scripts/train.py airbot_pi05 --exp-name=my_experiment")
         print(f"  3. Monitor training in wandb or tensorboard")
     else:
         print("[ERROR] FAILED: Dataset has critical issues that need to be fixed")

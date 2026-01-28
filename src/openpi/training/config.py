@@ -331,7 +331,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # leave the 7th action (gripper) unchanged, i.e. absolute.
         # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
         # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
-        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+        # transform bs ``absolute`` or ``delta`` actions out of the box.ased on whether your dataset use
 
         # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
         # extra delta transform.
@@ -361,7 +361,7 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
     Config for AirBot Play (6-DOF arm + gripper).
     
     This config processes data from the ethansan01/airbot_v2 LeRobot dataset for training.
-    AirBot has a single top-down camera and 12 action dimensions (6 arm + 6 hand).
+    AirBot has a top-down camera and a wrist camera, and 7 action dimensions (6 arm joints + 1 gripper).
     """
     
     repo_id: str = "ethansan01/airbot_v2"
@@ -373,10 +373,11 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "image",  # Single top-down camera
-                        "observation/state": "state",  # 12D joint positions
-                        "actions": "actions",  # 12D actions
-                        # Note: "task" will be converted to "prompt" by prompt_from_task=True
+                        "observation/image":           "image_top",    # Map 'top' to main image
+                        "observation/wrist_image":     "image_wrist",  # Map 'wrist' to wrist image
+                        "observation/state":           "state",
+                        "actions":                     "actions",
+                        "prompt":                      "task",
                     }
                 )
             ]
@@ -390,7 +391,7 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
         
         # AirBot actions are absolute joint positions, convert to deltas
         # All 7 dimensions (6 arm + gripper) use delta actions
-        delta_action_mask = _transforms.make_bool_mask(7)
+        delta_action_mask = _transforms.make_bool_mask(6, -1) # need to change this to (6,-1)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -398,7 +399,7 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
         
         # Model transforms (standard, no changes needed)
         # Use default_prompt to inject prompt if task lookup fails
-        model_transforms = ModelTransformFactory(default_prompt="Pick up the bottle and put it in the box")(model_config)
+        model_transforms = ModelTransformFactory(default_prompt="Pick up the red block and put it in the bowl")(model_config)
         
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
