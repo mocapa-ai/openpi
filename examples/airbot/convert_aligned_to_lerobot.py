@@ -6,27 +6,29 @@ to the LeRobot dataset format used by OpenPI for training.
 
 Usage:
     cd ~/openpi
-    uv run examples/airbot_robot/convert_aligned_to_lerobot.py \
+    uv run examples/airbot/convert_aligned_to_lerobot.py \
         --data_dir /path/to/aligned/hdf5/files \
         --output_name "your_username/robot_dataset" \
         --fps 10
 
 Input Format (from align_proprioception_pi.py):
-    /data/demo_0/
-      obs/
-        qpos              # (T, N) - Combined arm+hand positions
-        images/top        # (T, H, W, 3) - RGB camera
-      action              # (T, N) - Combined arm+hand actions
-      timestamps          # (T,) - Frame timestamps
-      task (attribute)    # Language instruction
+        /data/demo_0/
+            obs/
+                qpos               # (T, N) - Combined arm+hand positions
+                images/top         # (T, H, W, 3) - RGB 'top' camera view
+                images/wrist       # (T, H, W, 3) - RGB 'wrist' camera view (optional)
+            action               # (T, N) - Combined arm+hand actions
+            timestamps           # (T,) - Frame timestamps
+            task (attribute)     # Language instruction
 
 Output Format (LeRobot):
-    Saved to $HF_LEROBOT_HOME/your_username/robot_dataset/
-    Structure:
-      - state: qpos from input
-      - actions: actions from input
-      - image: top camera from input
-      - task: language instruction
+        Saved to $HF_LEROBOT_HOME/your_username/robot_dataset/
+        Structure:
+            - state: qpos from input
+            - actions: actions from input
+            - image_top: top camera images (if requested)
+            - image_wrist: wrist camera images (if requested)
+            - task: language instruction
 
 Author: Data Collection Pipeline
 Date: 2025
@@ -35,7 +37,7 @@ Date: 2025
 import argparse
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import h5py
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
@@ -61,7 +63,7 @@ def resize_image(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return np.array(resized)
 
 
-def load_aligned_hdf5(hdf5_path: Path) -> dict:
+def load_aligned_hdf5(hdf5_path: Path, camera_names: Optional[List[str]] = None) -> dict:
     """Load a single aligned episode from HDF5 file.
     
     Expected structure (from align_proprioception_pi.py):
@@ -101,7 +103,18 @@ def load_aligned_hdf5(hdf5_path: Path) -> dict:
         # Load data
         qpos = np.array(obs_grp['qpos'])
         actions = np.array(demo_grp['action'])
-        images = np.array(obs_grp['images']['top'])
+
+        # Load images for requested camera streams. If camera_names is None,
+        # try to load the 'top' stream as a sensible default (backwards
+        # compatibility with existing single-camera data).
+        images = {}
+        if camera_names is None:
+            camera_names = ['top']
+
+        for cam in camera_names:
+            if 'images' not in obs_grp or cam not in obs_grp['images']:
+                raise ValueError(f"Camera stream '{cam}' not found in {hdf5_path}")
+            images[cam] = np.array(obs_grp['images'][cam])
         
         # Load language instruction
         if 'task' in demo_grp.attrs:
@@ -118,7 +131,7 @@ def load_aligned_hdf5(hdf5_path: Path) -> dict:
     return {
         'qpos': qpos,
         'actions': actions,
-        'images': images,
+        'images': images,  # dict: camera_name -> (T, H, W, 3)
         'language': language
     }
 
@@ -126,10 +139,11 @@ def load_aligned_hdf5(hdf5_path: Path) -> dict:
 def main(
     data_dir: str,
     output_name: str = "your_username/airbot_robot_dataset",
-    fps: int = 10,
-    image_size: tuple[int, int] = (320, 180),
+    fps: int = 30,
+    image_size: tuple[int, int] = (224, 224),
     push_to_hub: bool = False,
     overwrite: bool = True,
+    cameras: Optional[List[str]] = None,
 ):
     """Convert aligned HDF5 robot data to LeRobot format.
     
@@ -164,8 +178,15 @@ def main(
     
     print(f"Found {len(hdf5_files)} HDF5 files to convert")
     
+    # Parse cameras list: if user provided a comma-separated string, split it.
+    # Default to two views commonly used in OpenPI collection: 'top' and 'wrist'.
+    if isinstance(cameras, str):
+        cameras = [c.strip() for c in cameras.split(',') if c.strip()]
+    if cameras is None:
+        cameras = ['top', 'wrist']
+
     # Load first episode to determine dimensions
-    first_episode = load_aligned_hdf5(hdf5_files[0])
+    first_episode = load_aligned_hdf5(hdf5_files[0], camera_names=cameras)
     state_dim = first_episode['qpos'].shape[1]
     action_dim = first_episode['actions'].shape[1]
     
@@ -174,25 +195,31 @@ def main(
     print(f"  Action dim: {action_dim}")
     
     # Create feature specification for LeRobot dataset
-    # Pi0.5 expects: "observation/state" -> "state", "observation/image" -> camera
-    # Note: "prompt" is handled automatically by LeRobot, don't define it here
+    # Pi0.5 expects: "observation/state" -> "state". For images we support
+    # one or more camera streams; each camera becomes its own image feature
+    # named `image_<camera_name>` (e.g. image_top, image_wrist).
+
     features = {
-        "image": {
-            "dtype": "image",
-            "shape": (image_size[1], image_size[0], 3),  # (height, width, channels)
-            "names": ["height", "width", "channel"],
+        'state': {
+            'dtype': 'float32',
+            'shape': (state_dim,),
+            'names': ['state'],
         },
-        "state": {
-            "dtype": "float32",
-            "shape": (state_dim,),
-            "names": ["state"],
-        },
-        "actions": {
-            "dtype": "float32",
-            "shape": (action_dim,),
-            "names": ["actions"],
+        'actions': {
+            'dtype': 'float32',
+            'shape': (action_dim,),
+            'names': ['actions'],
         },
     }
+
+    # Add one image feature per camera
+    for cam in cameras:
+        key = f'image_{cam}'
+        features[key] = {
+            'dtype': 'image',
+            'shape': (image_size[1], image_size[0], 3),
+            'names': ['height', 'width', 'channel'],
+        }
     
     print(f"Creating LeRobot dataset with features: {list(features.keys())}")
     
@@ -209,7 +236,7 @@ def main(
     # Convert each episode
     for hdf5_path in tqdm(hdf5_files, desc="Converting episodes"):
         try:
-            episode_data = load_aligned_hdf5(hdf5_path)
+            episode_data = load_aligned_hdf5(hdf5_path, camera_names=cameras)
             
             # Get episode length
             T = len(episode_data['qpos'])
@@ -217,17 +244,25 @@ def main(
             # Verify all arrays have same length
             assert len(episode_data['actions']) == T, \
                 f"Actions have {len(episode_data['actions'])} steps, expected {T}"
-            assert len(episode_data['images']) == T, \
-                f"Images have {len(episode_data['images'])} frames, expected {T}"
+            # For each requested camera, make sure image lengths match T
+            for cam in cameras:
+                if cam not in episode_data['images']:
+                    raise ValueError(f"Camera '{cam}' missing in {hdf5_path}")
+                assert len(episode_data['images'][cam]) == T, \
+                    f"Images for camera '{cam}' have {len(episode_data['images'][cam])} frames, expected {T}"
             
             # Add each frame to the dataset
             for t in range(T):
                 frame_dict = {
-                    "state": episode_data['qpos'][t].astype(np.float32),
-                    "actions": episode_data['actions'][t].astype(np.float32),
-                    "task": episode_data['language'],  # Use "task" like LIBERO
-                    "image": resize_image(episode_data['images'][t], image_size),
+                    'state': episode_data['qpos'][t].astype(np.float32),
+                    'actions': episode_data['actions'][t].astype(np.float32),
+                    'task': episode_data['language'],  # Use "task" like LIBERO
                 }
+
+                # Add each camera image under its feature key
+                for cam in cameras:
+                    key = f'image_{cam}'
+                    frame_dict[key] = resize_image(episode_data['images'][cam][t], image_size)
                 
                 dataset.add_frame(frame_dict)
             
@@ -261,16 +296,18 @@ if __name__ == "__main__":
                         help="Directory containing aligned HDF5 files (from align_proprioception_pi.py)")
     parser.add_argument("--output_name", type=str, default="your_username/airbot_robot_dataset",
                         help="Name for output dataset (format: username/dataset_name)")
-    parser.add_argument("--fps", type=int, default=10,
+    parser.add_argument("--fps", type=int, default=30,
                         help="Frames per second of the robot data")
-    parser.add_argument("--image_width", type=int, default=320,
+    parser.add_argument("--image_width", type=int, default=224,
                         help="Target image width")
-    parser.add_argument("--image_height", type=int, default=180,
+    parser.add_argument("--image_height", type=int, default=224,
                         help="Target image height")
     parser.add_argument("--push_to_hub", action="store_true",
                         help="Push dataset to Hugging Face Hub")
     parser.add_argument("--no_overwrite", action="store_true",
                         help="Don't overwrite existing dataset")
+    parser.add_argument("--cameras", type=str, default="top,wrist",
+                        help="Comma-separated camera names under obs/images (e.g. top,wrist)")
     
     args = parser.parse_args()
     
@@ -281,4 +318,5 @@ if __name__ == "__main__":
         image_size=(args.image_width, args.image_height),
         push_to_hub=args.push_to_hub,
         overwrite=not args.no_overwrite,
+        cameras=args.cameras,
     )

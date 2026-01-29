@@ -1,624 +1,339 @@
-#!/usr/bin/env python3
-"""
-AirBot + Revo2 Hand Validation Script
-
-This script validates a fine-tuned Pi0.5 policy on the AirBot arm with Revo2 hand.
-Uses the client-server architecture (same as ALOHA examples).
-
-Architecture:
-    Terminal 1 (uv): Policy server - runs model inference
-    Terminal 2 (conda): This script - controls robot hardware
-
-Usage:
-    # Terminal 1: Start policy server
-    cd ~/openpi
-    uv run scripts/serve_policy.py policy:checkpoint \
-        --policy.config=airbot_pi05 \
-        --policy.dir=checkpoints/airbot_pi05/airbot_v1/20000
-
-    # Terminal 2: Run this validation script (in conda env with robot deps)
-    conda activate your_robot_env
-    pip install ~/openpi/packages/openpi-client  # one-time
-    python examples/airbot/validate_airbot.py --host=localhost --port=8000
-
-Requirements (in conda env):
-    - openpi-client (pip install ~/openpi/packages/openpi-client)
-    - airbot_py (for AirBot arm control)
-    - Your revo2 hand library
-    - numpy, opencv-python
-"""
-
-import dataclasses
-import logging
-import sys
 import time
-from pathlib import Path
-from typing import Optional
-import rerun as rr
-
+import sys
+import re
+import threading
 import numpy as np
-from openpi_client import websocket_client_policy as _websocket_client_policy
+import cv2
+import rerun as rr
 import tyro
+import dataclasses
+from typing import Optional, Dict
+from PIL import Image
 
-# Add openpi root to Python path for revo2_library imports
-openpi_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(openpi_root))
+# Hardware Libraries
+from pyorbbecsdk import Pipeline, Context, Config, OBSensorType, OBFormat, OBFrameType
+from openpi_client import websocket_client_policy as _websocket_client_policy
 
-# =============================================================================
-# Robot imports from motion_retargeting
-# Adjust these imports based on your actual package structure
-# =============================================================================
-try:
-    from airbot_py.arm import AIRBOTPlay, RobotMode, SpeedProfile
-    AIRBOT_AVAILABLE = True
-except ImportError:
-    AIRBOT_AVAILABLE = False
-    print("[WARN] airbot_py not available - using dummy arm")
-
-
+# Robot Library (Adjust import if your airbot_py is located elsewhere)
+from airbot_py.arm import AIRBOTPlay, RobotMode, SpeedProfile
 
 
 # =============================================================================
-# Configuration
+# 1. Simplified Camera Logic (No complex states, just stream & rerun)
 # =============================================================================
-@dataclasses.dataclass
-class Args:
-    """Command line arguments for AirBot validation."""
+
+def process_color_frame(frame):
+    """Decodes Orbbec color frame to numpy RGB array."""
+    if frame is None:
+        return None
+    width = frame.get_width()
+    height = frame.get_height()
+    data = np.frombuffer(frame.get_data(), dtype=np.uint8)
     
-    # Policy server connection
-    host: str = "localhost"
-    port: int = 8000
+    # Resize/Reshape based on format (Assuming MJPG or RGB)
+    # If the SDK returns raw RGB:
+    if frame.get_format() == OBFormat.RGB:
+        data = data.reshape((height, width, 3))
+    # If MJPG, decode it
+    elif frame.get_format() == OBFormat.MJPG:
+        data = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        data = cv2.cvtColor(data, cv2.COLOR_BGR2RGB)
+    else:
+        # Fallback for other formats (YUYV etc), might need specific handling
+        return None
     
-    # Robot configuration
-    arm_port: str = "50001"  # AirBot serial port or IP
+    data = resize_image(data, (224, 224))
+    return data
 
-    # Rollout parameters
-    num_episodes: int = 5
-    max_episode_steps: int = 3000  # ~20 seconds at 30 Hz
-    control_freq: int = 10  # Hz
-    action_horizon: int = 15  # Execute N actions before re-querying policy
+def resize_image(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Resize image using PIL for high quality.
     
-    # Camera configuration (Orbbec)
-    # NOTE: Should match aspect ratio used during training for best results
-    # Training used 320x180 (16:9), so we capture at same aspect ratio
-    camera_width: int = 1280   # Will be resized by policy server
-    camera_height: int = 720  # 16:9 aspect ratio to match training
-    camera_fps: int = 30
+    Args:
+        image: Input image array (H, W, 3)
+        size: Target size (width, height)
     
-    # Home position for arm (6 DOF) - adjust to your setup
-    arm_home: tuple = (0, -1.52, 0.123, -1.54, -1.16, -0.632)
-    
-    # Prompts
-    default_prompt: str = "pick up the bottle and place it in the box"
+    Returns:
+        Resized image array
+    """
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8)
+    pil_image = Image.fromarray(image)
+    resized = pil_image.resize(size, resample=Image.BICUBIC)
+    return np.array(resized)
+
+class DualOrbbecStreamer:
+    """
+    Manages two Orbbec cameras (Top and Wrist).
+    Constantly fetches frames in background threads and logs to Rerun.
+    """
+    def __init__(self, top_serial: str, wrist_serial: str):
+        self.target_serials = {'top': top_serial, 'wrist': wrist_serial}
+        self.pipelines = []
+        self.latest_frames = {'top': None, 'wrist': None}
+        self.lock = threading.Lock()
+        self.ctx = Context()
+        
+
+
+    def connect(self):
+        device_list = self.ctx.query_devices()
+        dev_count = device_list.get_count()
+        print(f"[CAM] Found {dev_count} devices.")
+
+        for i in range(dev_count):
+            device = device_list.get_device_by_index(i)
+            
+            # 1. Identify Device Serial
+            serial = None
+            try:
+                # Regex parse the weird repr() string from Orbbec SDK
+                info_repr = repr(device.get_device_info())
+                m = re.search(r'serial_number=([^,\s\)]+)', info_repr)
+                if m: serial = m.group(1).strip()
+            except Exception:
+                pass
+
+            if not serial:
+                print(f"[CAM] Could not identify serial for device {i}")
+                continue
+
+            # 2. Match to Role
+            role = None
+            if serial == self.target_serials['top']: role = 'top'
+            elif serial == self.target_serials['wrist']: role = 'wrist'
+            
+            if role:
+                print(f"[CAM] Connecting to {role.upper()} camera (Serial: {serial})")
+                self._start_pipeline(device, role)
+            else:
+                print(f"[CAM] Ignoring device {serial} (not in target list)")
+
+    def _start_pipeline(self, device, role):
+        pipeline = Pipeline(device)
+        config = Config()
+        
+        # Try enabling Color stream
+        try:
+            profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            profile = profiles.get_default_video_stream_profile()
+            config.enable_stream(profile)
+        except Exception as e:
+            print(f"[CAM] Failed to enable color for {role}: {e}")
+            return
+
+        # Define Callback
+        def callback(frame_set):
+            color_frame = frame_set.get_color_frame()
+            if color_frame:
+                rgb = process_color_frame(color_frame)
+                if rgb is not None:
+                    # 1. Update latest frame safely
+                    with self.lock:
+                        self.latest_frames[role] = rgb
+                    
+                    # 2. Stream to Rerun immediately
+                    try:
+                        rr.log(f"world/camera/{role}", rr.Image(rgb), static=True)
+                    except Exception:
+                        pass
+
+        pipeline.start(config, callback)
+        self.pipelines.append(pipeline)
+
+    def get_latest(self) -> Dict[str, np.ndarray]:
+        """Returns the most recent frames for inference."""
+        with self.lock:
+            # Return a copy to avoid threading issues during inference
+            return {k: v.copy() if v is not None else None for k, v in self.latest_frames.items()}
+
+    def stop(self):
+        for p in self.pipelines:
+            try:
+                p.stop()
+            except: pass
 
 
 # =============================================================================
-# Robot Interface Classes
+# 2. Simplified Robot Logic
 # =============================================================================
+
 class AirBotArm:
-    """AirBot arm controller wrapper."""
-    
     def __init__(self, port: str):
         self.port = port
         self.robot = None
-        
-    def connect(self) -> bool:
-        """Connect to AirBot arm."""
-        if not AIRBOT_AVAILABLE:
-            print("[ARM] Using dummy arm (airbot_py not available)")
-            return True
-            
-        try:
-            print(f"[ARM] Connecting to AirBot on port {self.port}...")
-            self.robot = AIRBOTPlay(port=self.port)
-            self.robot.connect()
-            self.robot.set_speed_profile(SpeedProfile.SLOW)
-            self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
-            print("[ARM] Connected successfully")
-            return True
-        except Exception as e:
-            print(f"[ARM] Connection failed: {e}")
-            return False
-    
+
+    def connect(self):
+        self.robot = AIRBOTPlay(port = self.port)
+        print(f"[ROBOT] Connecting to AirBot on port {self.port}...")
+        self.robot.connect()
+        self.robot.set_speed_profile(SpeedProfile.SLOW)
+        self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
+
     def disconnect(self):
-        """Disconnect from arm."""
-        if self.robot:
-            try:
-                self.robot.disconnect()
-                print("[ARM] Disconnected")
-            except Exception as e:
-                print(f"[ARM] Disconnect error: {e}")
-    
-    def get_joint_positions(self) -> np.ndarray:
-        """Get current joint positions (6 DOF)."""
-        if not self.robot:
-            return np.zeros(6, dtype=np.float32)
-        try:
-            pos = self.robot.get_joint_pos()
-            return np.array(pos, dtype=np.float32)
-        except Exception as e:
-            print(f"[ARM] Error reading positions: {e}")
-            return np.zeros(6, dtype=np.float32)
-    
-    def set_joint_positions(self, positions: np.ndarray):
-        """Set joint positions (6 DOF)."""
-        if not self.robot:
-            return
-        try:
-            pos_list = positions.tolist() if isinstance(positions, np.ndarray) else list(positions)
-            self.robot.servo_joint_pos(joint_pos=pos_list)
-        except Exception as e:
-            print(f"[ARM] Error setting positions: {e}")
-    
-    def set_gripper_position(self, position):    
-        """Set gripper position (single DOF)."""
-        if not self.robot:
-            return
-        try:
-            # 1. If it's a numpy type, convert to python type (float or list)
-            if hasattr(position, 'tolist'):
-                position = position.tolist()
-                
-            # 2. If it is now a single float/int, wrap it in a list
-            if not isinstance(position, list):
-                position = [position]
-                
-            self.robot.servo_eef_pos(position)
-        except Exception as e:
-            print(f"[ARM] Error setting gripper position: {e}")
-    
-    def get_gripper_position(self):
-        """Get current gripper position (single DOF)."""
-        if not self.robot:
-            return np.zeros(1, dtype=np.float32)
-        try:
-            pos = self.robot.get_eef_pos()
-            return np.array(pos, dtype=np.float32)
-        except Exception as e:
-            print(f"[ARM] Error reading gripper position: {e}")
-            return np.zeros(1, dtype=np.float32)
+        if self.robot: self.robot.disconnect()
+
+    def get_state(self):
+        """Returns concatenated [arm_qpos(6), gripper_pos(1)]"""
+        if not self.robot: return np.zeros(7)
         
-    def move_to_home(self, home_pos: tuple, blocking: bool = True):
-        """Move arm to home position."""
-        if not self.robot:
-            print("[ARM] Dummy: would move to home")
-            return
-        try:
-            self.robot.switch_mode(RobotMode.PLANNING_POS)
-            self.robot.set_speed_profile(SpeedProfile.SLOW)
-            self.robot.move_to_joint_pos(joint_pos=list(home_pos), blocking=blocking)
-            self.robot.set_speed_profile(SpeedProfile.SLOW)
-            self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
-        except Exception as e:
-            print(f"[ARM] Error moving to home: {e}")
-
-
-
-
-
-class Camera:
-    """
-    Orbbec camera interface for RGB image capture.
-    
-    Uses pyorbbecsdk to capture frames from Orbbec cameras (e.g., Gemini 336).
-    Only captures RGB - simplified from the full multi_streams.py implementation.
-    """
-    
-    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.pipeline = None
-        self._connected = False
+        joints = np.array(self.robot.get_joint_pos(), dtype=np.float32)
         
-    def connect(self) -> bool:
-        """Connect to Orbbec camera and start RGB stream."""
-        try:
-            from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
-            
-            print(f"[CAMERA] Connecting to Orbbec camera ({self.width}x{self.height} @ {self.fps}fps)...")
-            
-            self.pipeline = Pipeline()
-            config = Config()
-            
-            # Configure color stream only (we just need RGB for policy)
-            try:
-                color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-                # Try to get requested resolution, fall back to what's available
-                color_profile = color_profiles.get_video_stream_profile(
-                    self.width, self.height, OBFormat.RGB, self.fps
-                )
-                config.enable_stream(color_profile)
-                print(f"[CAMERA] Using profile: {self.width}x{self.height} RGB @ {self.fps}fps")
-            except Exception as e:
-                print(f"[CAMERA] Warning: Could not get exact profile, trying defaults: {e}")
-                # Try common fallback resolutions
-                for res in [(1280, 720), (640, 480), (320, 240)]:
-                    try:
-                        color_profile = color_profiles.get_video_stream_profile(
-                            res[0], res[1], OBFormat.RGB, 30
-                        )
-                        config.enable_stream(color_profile)
-                        self.width, self.height = res
-                        print(f"[CAMERA] Using fallback profile: {res[0]}x{res[1]} RGB @ 30fps")
-                        break
-                    except:
-                        continue
-            
-            self.pipeline.start(config)
-            self._connected = True
-            print("[CAMERA] Connected successfully")
-            return True
-            
-        except ImportError:
-            print("[CAMERA] pyorbbecsdk not available - using dummy camera")
-            self._connected = False
-            return True  # Return True to allow validation to continue with dummy data
-            
-        except Exception as e:
-            print(f"[CAMERA] Connection failed: {e}")
-            self._connected = False
-            return False
-    
-    def disconnect(self):
-        """Stop camera pipeline."""
-        if self.pipeline:
-            try:
-                self.pipeline.stop()
-                print("[CAMERA] Disconnected")
-            except Exception as e:
-                print(f"[CAMERA] Disconnect error: {e}")
-        self._connected = False
-    
-    def get_frame(self) -> np.ndarray:
+        # Get raw gripper pos (0.0 - 0.065)
+        raw_gripper = np.array(self.robot.get_eef_pos(), dtype=np.float32)
+        if raw_gripper.ndim == 0: raw_gripper = raw_gripper.reshape(1)
+        
+        # Map to model range (0.0 - 0.036)
+        scaled_gripper = self._map_to_model(raw_gripper)
+        
+        return np.concatenate([joints, scaled_gripper])
+
+    def act(self, action):
+        """Expects 7D action: [arm(6), gripper(1)]"""
+        if not self.robot: return
+        
+        arm_cmd = action[:6]
+        
+        # Model outputs command in 0.0 - 0.036 range
+        model_gripper_cmd = action[6]
+        
+        # Map back to robot range (0.0 - 0.065)
+        robot_gripper_cmd = self._map_to_robot(model_gripper_cmd)
+        
+        # Clip to ensure safety
+        robot_gripper_cmd = np.clip(robot_gripper_cmd, 0.0, 0.065)
+
+        print(f"[ROBOT] Acting: Arm: {arm_cmd}, Gripper: {robot_gripper_cmd:.4f}")        
+        self.robot.servo_joint_pos(arm_cmd.tolist())
+        self.robot.servo_eef_pos([robot_gripper_cmd])
+
+    def move_home(self):
+        if not self.robot: return
+        home = [0.12569619715213776, -1.7263675928115845, 0.2725642919540405, -1.731708288192749, -1.2296863794326782, -0.7524605393409729]
+        self.robot.switch_mode(RobotMode.PLANNING_POS)
+        self.robot.move_to_joint_pos(home, blocking=True)
+        self.robot.switch_mode(RobotMode.SERVO_JOINT_POS)
+        self.robot.servo_eef_pos([0.065]) # Open gripper
+
+    def _map_to_model(self, gripper_pos):
         """
-        Get current RGB frame from camera.
-        
-        Returns:
-            np.ndarray: RGB image (H, W, 3) uint8
+        Maps robot range [0.0, 0.065] -> model range [0.0, 0.036]
         """
-        if not self._connected or self.pipeline is None:
-            # Return dummy frame if not connected
-            return np.random.randint(0, 255, (self.height, self.width, 3), dtype=np.uint8)
-        
-        try:
-            # Wait for frames with 100ms timeout
-            frames = self.pipeline.wait_for_frames(100)
-            if not frames:
-                print("[CAMERA] No frames received")
-                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                print("[CAMERA] No color frame")
-                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            
-            # Convert frame to RGB numpy array
+        # Linear mapping: y = (x / max_robot) * max_model
+        return (gripper_pos / 0.065) * 0.036
 
-            rgb_image = self._frame_to_rgb(color_frame)
-            rr.log("camera/rgb", rr.Image(rgb_image), static=True)
-            return rgb_image
-            
-        except Exception as e:
-            print(f"[CAMERA] Error getting frame: {e}")
-            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-    
-    def _frame_to_rgb(self, frame) -> np.ndarray:
+    def _map_to_robot(self, gripper_cmd):
         """
-        Convert Orbbec frame to RGB numpy array.
-        
-        Simplified version of frame_to_bgr_image from motion_retargeting.
+        Maps model range [0.0, 0.036] -> robot range [0.0, 0.065]
         """
-        try:
-            from pyorbbecsdk import OBFormat
-            import cv2
-            
-            width = frame.get_width()
-            height = frame.get_height()
-            color_format = frame.get_format()
-            data = np.asanyarray(frame.get_data())
-            
-            if color_format == OBFormat.RGB:
-                # Already RGB, just reshape
-                image = np.resize(data, (height, width, 3))
-                return image.astype(np.uint8)
-                
-            elif color_format == OBFormat.BGR:
-                # Convert BGR to RGB
-                image = np.resize(data, (height, width, 3))
-                return cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.uint8)
-                
-            elif color_format == OBFormat.MJPG:
-                # Decode MJPEG
-                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                if image is not None:
-                    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.uint8)
-                    
-            elif color_format == OBFormat.YUYV:
-                image = np.resize(data, (height, width, 2))
-                bgr = cv2.cvtColor(image, cv2.COLOR_YUV2BGR_YUYV)
-                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
-            
-            # Fallback: try to interpret as RGB
-            print(f"[CAMERA] Unknown format {color_format}, attempting raw conversion")
-            image = np.resize(data, (height, width, 3))
-            return image.astype(np.uint8)
-            
-        except Exception as e:
-            print(f"[CAMERA] Frame conversion error: {e}")
-            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
+        # Linear mapping: y = (x / max_model) * max_robot
+        return (gripper_cmd / 0.036) * 0.065
 
 # =============================================================================
-# Validation Logic
+# 3. Main Validation Loop
 # =============================================================================
-def run_episode(
-    policy: _websocket_client_policy.WebsocketClientPolicy,
-    arm: AirBotArm,
-    camera: Camera,
-    args: Args,
-    prompt: str,
-) -> dict:
-    """
-    Run a single validation episode.
+
+@dataclasses.dataclass
+class Args:
+    # Policy Server
+    host: str = "localhost"
+    port: int = 8000
     
-    Returns:
-        dict with episode results
-    """
-    dt = 1.0 / args.control_freq
+    # Robot
+    arm_port: str = "50001" # Check your USB/Serial port
     
-    print(f"\n{'='*60}")
-    print(f"Starting episode: '{prompt}'")
-    print(f"{'='*60}")
+    # Camera Serials
+    top_cam_serial: str = "CP7JC42000EY"
+    wrist_cam_serial: str = "CP7JC42000F4"
     
-    # Move to home position
-    print("[EPISODE] Moving to home position...")
-    arm.move_to_home(args.arm_home, blocking=True)
-    arm.set_gripper_position(0.0)  # Close gripper
-    time.sleep(1.0)
+    # Tuning
+    action_horizon: int =30  # How many actions to execute per inference
+    control_freq: int = 30    # Hz
     
-    input("Press Enter when ready to start...")
+    prompt: str = "pick up the red block and place it in the bowl"
+
+def main(args: Args):
+    # 1. Setup Rerun
+    rr.init("pi0_validation", spawn=True)
+
+    # 2. Connect Hardware
+    print("[SYS] Connecting to Cameras...")
+    cameras = DualOrbbecStreamer(args.top_cam_serial, args.wrist_cam_serial)
+    cameras.connect()
     
-    steps_completed = 0
-    start_time = time.time()
+    # Wait a second for auto-exposure/white balance
+    time.sleep(2.0) 
+
+    print("[SYS] Connecting to Robot...")
+    robot = AirBotArm(args.arm_port)
+    robot.connect()
+    robot.move_home()
+
+    # 3. Connect Policy
+    print(f"[SYS] Connecting to Policy Server ({args.host}:{args.port})...")
+    policy = _websocket_client_policy.WebsocketClientPolicy(host=args.host, port=args.port)
     
+    # Warmup
+    print("[SYS] Warming up model...")
+    policy.infer({
+        "observation/image": np.zeros((224,224,3), dtype=np.uint8),
+        "observation/wrist_image": np.zeros((224,224,3), dtype=np.uint8),
+        "observation/state": np.zeros(7, dtype=np.float32),
+        "prompt": args.prompt
+    })
+
+    print("\n" + "="*40)
+    print(" READY TO VALIDATE")
+    print("="*40)
+    input("Press Enter to start episode...")
+
     try:
-        for step in range(args.max_episode_steps):
-            step_start = time.time()
+        dt = 1.0 / args.control_freq
+        
+        while True:
+            cycle_start = time.time()
 
+            # --- A. GET DATA ---
+            frames = cameras.get_latest()
+            robot_state = robot.get_state()
             
-            # 1. Get observation
-            image = camera.get_frame()
-            arm_joints = arm.get_joint_positions()
-            gripper_position = arm.get_gripper_position()
-            state = np.concatenate([arm_joints, gripper_position]).astype(np.float32)
-            
+            if frames['top'] is None or frames['wrist'] is None:
+                print("[WARN] Waiting for frames...", end='\r')
+                time.sleep(0.1)
+                continue
 
-            # 2. Build observation dict for policy
-            observation = {
-                "observation/image": image,
-                "observation/state": state,
-                "prompt": prompt,
+            # --- B. INFERENCE ---
+            obs = {
+                "observation/image": frames['top'],
+                "observation/wrist_image": frames['wrist'],
+                "observation/state": robot_state,
+                "prompt": args.prompt
             }
             
-            # 3. Query policy
-            result = policy.infer(observation)
-            actions = result["actions"]  # Shape: (N, 7)
-            print(f"[EPISODE] Policy returned {len(actions)} actions")
+            result = policy.infer(obs)
+            actions = result['actions'] # Shape: [Horizon, 7]
+
+            # --- C. EXECUTE HORIZON ---
+            # We execute a chunk of actions (Horizon) open-loop to reduce inference latency effects
+            chunk_size = min(args.action_horizon, len(actions))
             
-            
-            
-            # 4. Execute action chunk (open-loop)
-            for i in range(min(args.action_horizon, len(actions))):
-                action = actions[i]
-                print(f"[EPISODE] action list: {action}")
-                # Split action into arm and hand
-                arm_action = action[0:6]
-                gripper_action = action[6:7]
-                
-                # Execute
-                safe_arm_action = np.clip(arm_action[2], 0.0, 3.14)
-                safe_arm_action_4 = np.clip(arm_action[4], -1.75, 2.0)
-                new_arm_action = arm_action.copy()
-                new_arm_action[2] = safe_arm_action
-                new_arm_action[4] = safe_arm_action_4
-                new_gripper_action = abs(gripper_action)
-                print(f"[EPISODE] Executing arm action: {new_arm_action}, gripper action: {new_gripper_action}")
-                arm.set_joint_positions(new_arm_action)
-                arm.set_gripper_position(new_gripper_action)
-                
-                # Maintain control frequency
-                elapsed = time.time() - step_start
-                sleep_time = dt - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            for i in range(chunk_size):
                 step_start = time.time()
                 
-                steps_completed += 1
+                robot.act(actions[i])
                 
-                if steps_completed >= args.max_episode_steps:
-                    break
-            
-            # Print progress
-            if step % 30 == 0:
-                print(f"  Step {steps_completed}/{args.max_episode_steps}", end="\r")
-                
+                # Sleep to maintain control frequency
+                elapsed = time.time() - step_start
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+
+            print(f"[Run] Executed {chunk_size} actions", end='\r')
+
     except KeyboardInterrupt:
-        print("\n[EPISODE] Stopped by user")
-    
-    duration = time.time() - start_time
-    print(f"\n[EPISODE] Completed {steps_completed} steps in {duration:.1f}s")
-    
-    # Get success rating from user
-    print("\nHow did the robot do?")
-    success_input = input("Success (0-100, y=100, n=0): ").strip().lower()
-    
-    if success_input == "y":
-        success = 1.0
-    elif success_input == "n":
-        success = 0.0
-    else:
-        try:
-            success = float(success_input) / 100.0
-            success = np.clip(success, 0.0, 1.0)
-        except ValueError:
-            success = 0.0
-    
-    return {
-        "prompt": prompt,
-        "steps": steps_completed,
-        "duration": duration,
-        "success": success,
-    }
-
-
-def main(args: Args) -> None:
-    """Main validation loop."""
-    rr.init("airbot_validation", spawn=True)
-    print("=" * 70)
-    print("AirBot + Revo2 Hand Policy Validation")
-    print("=" * 70)
-    print(f"\nConnecting to policy server at {args.host}:{args.port}...")
-    
-    # 1. Connect to policy server
-    policy = _websocket_client_policy.WebsocketClientPolicy(
-        host=args.host,
-        port=args.port,
-    )
-    metadata = policy.get_server_metadata()
-    logging.info(f"Server metadata: {metadata}")
-    print(f"[POLICY] Connected! Metadata: {metadata}")
-    
-    # 2. Initialize robot hardware
-    print("\nInitializing robot hardware...")
-    
-    arm = AirBotArm(args.arm_port)
-    if not arm.connect():
-        print("[ERROR] Failed to connect to arm")
-        return
-    
-    camera = Camera(width=args.camera_width, height=args.camera_height, fps=args.camera_fps)
-    if not camera.connect():
-        print("[ERROR] Failed to connect to camera")
-        arm.disconnect()
-        return
-    
-    print("[ROBOT] All hardware initialized")
-    
-    # Quick hardware test
-    print("\n" + "="*70)
-    print("HARDWARE TEST")
-    print("="*70)
-    print("Testing hardware connections...")
-    
-    # Test arm - read position
-    try:
-        arm_pos = arm.get_joint_positions()
-        gripper_pos = arm.get_gripper_position()
-        print(f"[ARM] Current position: {arm_pos}")
-        print(f"[ARM] Current gripper position: {gripper_pos}")
-        print(f"[ARM] ✓ Reading positions successfully")
-    except Exception as e:
-        print(f"[ARM] ✗ Error reading positions: {e}")
-    # Test camera
-    try:
-        frame = camera.get_frame()
-        print(f"[CAMERA] Frame shape: {frame.shape}")
-        print(f"[CAMERA] ✓ Capturing frames successfully")
-    except Exception as e:
-        print(f"[CAMERA] ✗ Error capturing frame: {e}")
-    
-    print("="*70)
-    print("Review the hardware test results above.")
-    print("="*70)
-    
-    # Interactive movement tests
-    print("\n" + "="*70)
-    print("INTERACTIVE HARDWARE MOVEMENT TEST")
-    print("="*70)
-    print("This will test actual hardware movements.")
-    print("Make sure the robot has clear space to move safely!")
-    print()
-    
-    proceed = input("Proceed with movement test? [y/n]: ").strip().lower()
-    if proceed == 'y':
-        # Test 1: Move arm to home position
-        print("\n[TEST 1/3] Moving arm to home position...")
-        print(f"[ARM] Target home position: {args.arm_home}")
-        try:
-            arm.move_to_home(args.arm_home, blocking=True)
-            print("[ARM] ✓ Successfully moved to home position")
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"[ARM] ✗ Error moving to home: {e}")
-
-    
-    print("\nIf everything looks good, press Enter to start validation...")
-    print("Otherwise, press Ctrl+C to exit and fix issues.")
-    input()
-    
-    # 3. Warm up policy (first inference is slow)
-    print("\nWarming up policy...")
-    dummy_obs = {
-        "observation/image": np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8),
-        "observation/state": np.zeros(7, dtype=np.float32),
-        "prompt": args.default_prompt,
-    }
-    for _ in range(2):
-        policy.infer(dummy_obs)
-    print("[POLICY] Warmed up")
-    
-    # 4. Run validation episodes
-    results = []
-    
-    try:
-        for ep in range(args.num_episodes):
-            print(f"\n{'#'*70}")
-            print(f"Episode {ep + 1}/{args.num_episodes}")
-            print(f"{'#'*70}")
-            
-            # Get prompt from user
-            prompt = input(f"Enter instruction (default: '{args.default_prompt}'): ").strip()
-            if not prompt:
-                prompt = args.default_prompt
-            
-            # Run episode
-            result = run_episode(policy, arm, camera, args, prompt)
-            results.append(result)
-            
-            # Print running stats
-            avg_success = np.mean([r["success"] for r in results])
-            print(f"\n[STATS] Episodes: {len(results)}, Avg Success: {avg_success*100:.1f}%")
-            
-            if ep < args.num_episodes - 1:
-                cont = input("\nContinue to next episode? [y/n]: ").strip().lower()
-                if cont != "y":
-                    break
-                    
-    except KeyboardInterrupt:
-        print("\n\nValidation interrupted by user")
-    
-    # 5. Cleanup
-    print("\nCleaning up...")
-    arm.disconnect()
-    camera.disconnect()
-    
-    # 6. Print summary
-    if results:
-        print("\n" + "=" * 70)
-        print("VALIDATION SUMMARY")
-        print("=" * 70)
-        print(f"Total episodes: {len(results)}")
-        print(f"Average success: {np.mean([r['success'] for r in results])*100:.1f}%")
-        print(f"Average duration: {np.mean([r['duration'] for r in results]):.1f}s")
-        print("\nPer-episode results:")
-        for i, r in enumerate(results):
-            print(f"  {i+1}. '{r['prompt']}' - {r['success']*100:.0f}% success, {r['steps']} steps")
-        print("=" * 70)
-    
-    print("\nDone!")
-
+        print("\n[SYS] Stopping...")
+    finally:
+        cameras.stop()
+        robot.disconnect()
+        print("[SYS] Clean shutdown.")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     tyro.cli(main)

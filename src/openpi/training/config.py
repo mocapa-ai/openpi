@@ -364,7 +364,7 @@ class LeRobotAirBotDataConfig(DataConfigFactory):
     AirBot has a top-down camera and a wrist camera, and 7 action dimensions (6 arm joints + 1 gripper).
     """
     
-    repo_id: str = "ethansan01/airbot_v2"
+    repo_id: str = "ethansan01/airbot_v3"
     
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
